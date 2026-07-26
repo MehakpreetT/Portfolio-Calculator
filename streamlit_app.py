@@ -117,15 +117,31 @@ STRATEGY_NOTES = {
 # 2. USER ACCOUNTS (streamlit-authenticator)
 # =======================================================================
 def load_or_create_user_config():
+    cookie_key = st.secrets.get("cookie_key", None) if hasattr(st, "secrets") else None
+    if cookie_key is None:
+        st.error("No cookie_key found in st.secrets — see the setup instructions to add one before using login.")
+        st.stop()
+
     if not os.path.exists(USERS_FILE):
+        test_password_hash = stauth.Hasher().hash("test1234")
         config = {
-            "credentials": {"usernames": {}},
-            "cookie": {"name": "portpicker_auth", "key": "portpicker_signature_key", "expiry_days": 30},
+            "credentials": {
+                "usernames": {
+                    "testuser": {
+                        "email": "test@portpicker.demo",
+                        "name": "Test User",
+                        "password": test_password_hash,
+                    }
+                }
+            },
+            "cookie": {"name": "portpicker_auth", "key": cookie_key, "expiry_days": 30},
         }
         with open(USERS_FILE, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
     with open(USERS_FILE, "r") as f:
-        return yaml.load(f, Loader=SafeLoader)
+        loaded = yaml.load(f, Loader=SafeLoader)
+    loaded["cookie"]["key"] = cookie_key  # always use the current secret, even if users.yaml predates it
+    return loaded
 
 
 def save_user_config(config):

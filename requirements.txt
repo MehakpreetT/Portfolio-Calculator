@@ -8,3 +8,4 @@ streamlit-authenticator
 streamlit-option-menu
 fpdf2
 pyyaml
+pandas-datareader

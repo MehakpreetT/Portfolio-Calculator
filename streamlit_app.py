@@ -3,21 +3,30 @@ PortPicker — Forward-Looking Portfolio Construction Web App
 --------------------------------------------------------------
 Run locally with:  streamlit run streamlit_app.py
 
-Tabs:
-  1. Calculator          -> build a recommended portfolio, then optionally
-                            override weights manually and save it
-  2. Backtest & Risk      -> historical performance + Sharpe ratio for the
-                            current portfolio vs. a 60/40 benchmark
-  3. Compare Profiles     -> Conservative / Neutral / Growth side-by-side
-  4. Market News          -> recent headlines per asset class (via yfinance)
-  5. Saved Portfolios     -> view/manage portfolios you've saved
-  6. Strategy Guide       -> philosophy behind each risk profile
+Login: first run auto-creates a default account file (users.yaml).
+Register a new account from the login screen's "Register" tab.
 
-New asset classes added vs. the original 6-sleeve version:
-  - Gold / Commodities (CGL.TO)
-  - REITs (XRE.TO)
-These add diversification beyond pure equities/bonds and are standard
-inclusions in most real multi-asset portfolios.
+Tabs:
+  1. Calculator          -> build a recommended portfolio, add custom
+                            tickers, override weights, set a stop-loss,
+                            validate, and save it to your account
+  2. Backtest & Risk      -> historical performance + Sharpe ratio
+  3. Efficient Frontier   -> Monte Carlo simulated frontier vs. your portfolio
+  4. Correlation Heatmap  -> how your asset classes move relative to each other
+  5. Compare Profiles     -> Conservative / Neutral / Growth side-by-side
+  6. Market News          -> recent headlines per asset class
+  7. Saved Portfolios     -> your saved strategies (per account)
+  8. Strategy Guide       -> philosophy behind each risk profile
+
+New since last version:
+  - User accounts (streamlit-authenticator) — saved portfolios are now
+    private per logged-in user instead of one shared file
+  - Efficient frontier (Monte Carlo + scipy-optimized max-Sharpe point)
+  - Correlation heatmap across all held asset classes
+  - PDF and CSV export of your current allocation
+  - Data validation panel (weight sum, ticker validity, amount sanity)
+  - Stop-loss threshold — flags if backtest drawdown would have breached it
+  - Custom ticker search — add any North American ticker as a holding
 """
 
 import streamlit as st
@@ -27,11 +36,20 @@ import numpy as np
 import plotly.graph_objects as go
 import json
 import os
+import io
+import yaml
+from yaml.loader import SafeLoader
+import streamlit_authenticator as stauth
+from fpdf import FPDF
+from scipy.optimize import minimize
 from enum import Enum
 from datetime import date
 
-SAVE_FILE = "saved_portfolios.json"
-RISK_FREE_RATE = 0.03  # annualized, used for Sharpe ratio calc
+USERS_FILE = "users.yaml"
+SAVE_DIR = "saved_portfolios"
+RISK_FREE_RATE = 0.03
+
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 
 # =======================================================================
@@ -43,7 +61,6 @@ class RiskProfile(Enum):
     GROWTH = "Growth"
 
 
-# Updated to include Gold/Commodities and REITs as two new sleeves
 STRATEGIC_MIX = {
     RiskProfile.CONSERVATIVE: {"cash": 0.02, "bonds": 0.53, "cdn_eq": 0.12, "us_eq": 0.13, "intl_eq": 0.10, "em_eq": 0.00, "gold": 0.05, "reit": 0.05},
     RiskProfile.NEUTRAL:      {"cash": 0.02, "bonds": 0.33, "cdn_eq": 0.13, "us_eq": 0.22, "intl_eq": 0.13, "em_eq": 0.04, "gold": 0.05, "reit": 0.08},
@@ -97,7 +114,62 @@ STRATEGY_NOTES = {
 
 
 # =======================================================================
-# 2. CORE LOGIC
+# 2. USER ACCOUNTS (streamlit-authenticator)
+# =======================================================================
+def load_or_create_user_config():
+    if not os.path.exists(USERS_FILE):
+        config = {
+            "credentials": {"usernames": {}},
+            "cookie": {"name": "portpicker_auth", "key": "portpicker_signature_key", "expiry_days": 30},
+        }
+        with open(USERS_FILE, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+    with open(USERS_FILE, "r") as f:
+        return yaml.load(f, Loader=SafeLoader)
+
+
+def save_user_config(config):
+    with open(USERS_FILE, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
+
+
+def user_portfolio_file(username):
+    return os.path.join(SAVE_DIR, f"{username}.json")
+
+
+def load_saved_portfolios(username):
+    path = user_portfolio_file(username)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_portfolio(username, name, amount, risk_profile, horizon, weights, stop_loss=None):
+    portfolios = load_saved_portfolios(username)
+    portfolios.append({
+        "name": name,
+        "date_saved": str(date.today()),
+        "amount": amount,
+        "risk_profile": risk_profile,
+        "horizon": horizon,
+        "weights": weights,
+        "stop_loss": stop_loss,
+    })
+    with open(user_portfolio_file(username), "w") as f:
+        json.dump(portfolios, f, indent=2)
+
+
+def delete_portfolio(username, index):
+    portfolios = load_saved_portfolios(username)
+    if 0 <= index < len(portfolios):
+        portfolios.pop(index)
+        with open(user_portfolio_file(username), "w") as f:
+            json.dump(portfolios, f, indent=2)
+
+
+# =======================================================================
+# 3. CORE ALLOCATION LOGIC
 # =======================================================================
 def horizon_tilt(years: float) -> float:
     if years >= 15:
@@ -163,7 +235,25 @@ def build_portfolio(risk_profile, horizon_years, market_score):
 
 
 # =======================================================================
-# 3. BACKTEST + SHARPE RATIO
+# 4. CUSTOM TICKER VALIDATION
+# =======================================================================
+@st.cache_data(ttl=60 * 60 * 6)
+def validate_ticker(ticker: str):
+    """Returns (is_valid, display_name) for any North American ticker."""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="5d")
+        if hist.empty:
+            return False, None
+        info = t.info
+        name = info.get("shortName") or info.get("longName") or ticker
+        return True, name
+    except Exception:
+        return False, None
+
+
+# =======================================================================
+# 5. PRICE HISTORY / BACKTEST / EFFICIENT FRONTIER
 # =======================================================================
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_price_history(tickers_tuple, period):
@@ -174,9 +264,9 @@ def fetch_price_history(tickers_tuple, period):
     return data
 
 
-def run_backtest(weights: dict, years: int):
+def run_backtest(weights: dict, tickers_map: dict, years: int, stop_loss_pct=None):
     period = "1y" if years <= 1 else ("5y" if years <= 5 else "10y")
-    tickers_used = {k: TICKERS[k] for k in weights if TICKERS[k] is not None}
+    tickers_used = {k: tickers_map[k] for k in weights if tickers_map.get(k) is not None}
 
     try:
         prices = fetch_price_history(tuple(tickers_used.values()), period)
@@ -185,9 +275,9 @@ def run_backtest(weights: dict, years: int):
 
         port_daily = pd.Series(0.0, index=daily_returns.index)
         for k, w in weights.items():
-            ticker = TICKERS[k]
+            ticker = tickers_map.get(k)
             if ticker is None:
-                continue  # cash contributes via the risk-free adjustment below
+                continue
             if ticker in daily_returns.columns:
                 port_daily += w * daily_returns[ticker]
 
@@ -200,7 +290,16 @@ def run_backtest(weights: dict, years: int):
 
         cumulative = (1 + port_daily).cumprod() * 100
 
-        # Benchmark: simple 60/40 (VFV.TO / XBB.TO)
+        running_max = cumulative.cummax()
+        drawdown = (cumulative - running_max) / running_max
+        max_drawdown = drawdown.min()
+
+        stop_loss_breach_date = None
+        if stop_loss_pct is not None:
+            breached = drawdown[drawdown <= -abs(stop_loss_pct) / 100]
+            if not breached.empty:
+                stop_loss_breach_date = breached.index[0].strftime("%Y-%m-%d")
+
         bench_tickers = ["VFV.TO", "XBB.TO"]
         bench_prices = fetch_price_history(tuple(bench_tickers), period).dropna()
         bench_returns = bench_prices.pct_change().dropna()
@@ -211,33 +310,65 @@ def run_backtest(weights: dict, years: int):
         bench_sharpe = (bench_ann_return - RISK_FREE_RATE) / bench_ann_vol if bench_ann_vol > 0 else float("nan")
 
         return {
-            "cumulative": cumulative,
-            "bench_cumulative": bench_cumulative,
-            "ann_return": ann_return,
-            "ann_vol": ann_vol,
-            "sharpe": sharpe,
-            "bench_ann_return": bench_ann_return,
-            "bench_ann_vol": bench_ann_vol,
-            "bench_sharpe": bench_sharpe,
+            "cumulative": cumulative, "bench_cumulative": bench_cumulative,
+            "ann_return": ann_return, "ann_vol": ann_vol, "sharpe": sharpe,
+            "max_drawdown": max_drawdown, "stop_loss_breach_date": stop_loss_breach_date,
+            "bench_ann_return": bench_ann_return, "bench_ann_vol": bench_ann_vol, "bench_sharpe": bench_sharpe,
+            "daily_returns": daily_returns,
         }
     except Exception as e:
         return {"error": str(e)}
 
 
+def compute_efficient_frontier(daily_returns: pd.DataFrame, n_portfolios=3000):
+    mean_returns = daily_returns.mean() * 252
+    cov_matrix = daily_returns.cov() * 252
+    n_assets = len(mean_returns)
+
+    results = np.zeros((3, n_portfolios))
+    weights_record = []
+    for i in range(n_portfolios):
+        w = np.random.random(n_assets)
+        w /= np.sum(w)
+        weights_record.append(w)
+        port_return = np.dot(w, mean_returns)
+        port_vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
+        sharpe = (port_return - RISK_FREE_RATE) / port_vol if port_vol > 0 else 0
+        results[0, i] = port_vol
+        results[1, i] = port_return
+        results[2, i] = sharpe
+
+    # Solve for max-Sharpe portfolio directly via optimizer
+    def neg_sharpe(w):
+        r = np.dot(w, mean_returns)
+        v = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
+        return -(r - RISK_FREE_RATE) / v if v > 0 else 0
+
+    constraints = ({"type": "eq", "fun": lambda w: np.sum(w) - 1})
+    bounds = tuple((0, 1) for _ in range(n_assets))
+    init_guess = np.array([1 / n_assets] * n_assets)
+    opt_result = minimize(neg_sharpe, init_guess, method="SLSQP", bounds=bounds, constraints=constraints)
+    optimal_weights = opt_result.x
+    opt_return = np.dot(optimal_weights, mean_returns)
+    opt_vol = np.sqrt(np.dot(optimal_weights.T, np.dot(cov_matrix, optimal_weights)))
+
+    return results, mean_returns.index.tolist(), optimal_weights, opt_return, opt_vol
+
+
 # =======================================================================
-# 4. NEWS (via yfinance's built-in news feed per ticker)
+# 6. NEWS
 # =======================================================================
 @st.cache_data(ttl=60 * 60 * 2)
-def fetch_news_for_asset_classes():
+def fetch_news_for_asset_classes(tickers_map):
     news_by_class = {}
-    for key, ticker in TICKERS.items():
+    for key, ticker in tickers_map.items():
         if ticker is None:
             continue
         try:
             items = yf.Ticker(ticker).news[:3]
             headlines = []
             for item in items:
-                content = item.get("content", item)  # yfinance news schema varies by version
+                content = item.get("content", item)
                 title = content.get("title") or item.get("title", "Untitled")
                 link = (content.get("canonicalUrl") or {}).get("url") or item.get("link", "")
                 publisher = (content.get("provider") or {}).get("displayName", "")
@@ -249,39 +380,46 @@ def fetch_news_for_asset_classes():
 
 
 # =======================================================================
-# 5. SAVE / LOAD PORTFOLIOS
+# 7. EXPORT (CSV + PDF)
 # =======================================================================
-def load_saved_portfolios():
-    if os.path.exists(SAVE_FILE):
-        with open(SAVE_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-
-def save_portfolio(name, amount, risk_profile, horizon, weights):
-    portfolios = load_saved_portfolios()
-    portfolios.append({
-        "name": name,
-        "date_saved": str(date.today()),
-        "amount": amount,
-        "risk_profile": risk_profile,
-        "horizon": horizon,
-        "weights": weights,
+def build_csv(weights, amount, labels_map, tickers_map):
+    df = pd.DataFrame({
+        "Asset Class": [labels_map.get(k, k) for k in weights],
+        "Ticker": [tickers_map.get(k) or "N/A" for k in weights],
+        "Weight (%)": [round(v * 100, 2) for v in weights.values()],
+        "Dollar Amount": [round(amount * v, 2) for v in weights.values()],
     })
-    with open(SAVE_FILE, "w") as f:
-        json.dump(portfolios, f, indent=2)
+    return df.to_csv(index=False).encode("utf-8")
 
 
-def delete_portfolio(index):
-    portfolios = load_saved_portfolios()
-    if 0 <= index < len(portfolios):
-        portfolios.pop(index)
-        with open(SAVE_FILE, "w") as f:
-            json.dump(portfolios, f, indent=2)
+def build_pdf(weights, amount, risk_profile, horizon, labels_map, tickers_map):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "PortPicker - Portfolio Allocation Report", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 8, f"Generated: {date.today()}", ln=True)
+    pdf.cell(0, 8, f"Amount: ${amount:,.2f}   Risk Profile: {risk_profile}   Horizon: {horizon} yrs", ln=True)
+    pdf.ln(5)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(70, 8, "Asset Class", border=1)
+    pdf.cell(40, 8, "Ticker", border=1)
+    pdf.cell(30, 8, "Weight", border=1)
+    pdf.cell(40, 8, "Dollar Amount", border=1, ln=True)
+
+    pdf.set_font("Helvetica", "", 10)
+    for k, w in weights.items():
+        pdf.cell(70, 8, labels_map.get(k, k), border=1)
+        pdf.cell(40, 8, str(tickers_map.get(k) or "N/A"), border=1)
+        pdf.cell(30, 8, f"{w*100:.1f}%", border=1)
+        pdf.cell(40, 8, f"${amount*w:,.2f}", border=1, ln=True)
+
+    return bytes(pdf.output(dest="S"))
 
 
 # =======================================================================
-# 6. PAGE CONFIG + STYLE
+# 8. PAGE CONFIG + STYLE
 # =======================================================================
 st.set_page_config(page_title="PortPicker", page_icon="📊", layout="wide")
 
@@ -289,41 +427,61 @@ st.markdown("""
     <style>
         .main { background-color: #0e1117; }
         h1, h2, h3 { color: #e8eaed; }
-        .metric-card {
-            background-color: #1c1f26;
-            border-radius: 12px;
-            padding: 18px;
-            border: 1px solid #2b2f38;
-        }
         .stButton>button {
-            background-color: #2c3e50;
-            color: white;
-            border-radius: 8px;
-            font-weight: 600;
-            padding: 0.5em 1.5em;
+            background-color: #2c3e50; color: white; border-radius: 8px;
+            font-weight: 600; padding: 0.5em 1.5em;
         }
-        .stButton>button:hover {
-            background-color: #34495e;
-            color: white;
-        }
+        .stButton>button:hover { background-color: #34495e; color: white; }
     </style>
 """, unsafe_allow_html=True)
 
+# --- Authentication ---
+config = load_or_create_user_config()
+authenticator = stauth.Authenticate(
+    config["credentials"], config["cookie"]["name"], config["cookie"]["key"], config["cookie"]["expiry_days"]
+)
+
 st.title("📊 PortPicker")
+
+login_tab, register_tab = st.tabs(["Login", "Register"])
+with login_tab:
+    authenticator.login()
+with register_tab:
+    try:
+        email, username, name = authenticator.register_user(pre_authorized=None)
+        if email:
+            save_user_config(config)
+            st.success("Account created — please log in from the Login tab.")
+    except Exception as e:
+        st.error(str(e))
+
+if st.session_state.get("authentication_status") is False:
+    st.error("Username or password is incorrect.")
+    st.stop()
+elif st.session_state.get("authentication_status") is None:
+    st.info("Log in or register above to build and save portfolios.")
+    st.stop()
+
+# --- Logged in from here on ---
+username = st.session_state["username"]
+with st.sidebar:
+    st.write(f"Logged in as **{st.session_state['name']}**")
+    authenticator.logout()
+
 st.caption("Builds a target asset allocation from your risk profile, horizon, and the prior trading day's market conditions.")
 
-if "current_weights" not in st.session_state:
-    st.session_state.current_weights = None
-if "current_amount" not in st.session_state:
-    st.session_state.current_amount = 20000.0
-if "current_risk" not in st.session_state:
-    st.session_state.current_risk = RiskProfile.NEUTRAL.value
-if "current_horizon" not in st.session_state:
-    st.session_state.current_horizon = 10
+# --- Session state defaults ---
+for key, default in [
+    ("current_weights", None), ("current_amount", 20000.0), ("current_risk", RiskProfile.NEUTRAL.value),
+    ("current_horizon", 10), ("custom_tickers", {}), ("stop_loss_pct", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["🧮 Calculator", "📈 Backtest & Risk", "⚖️ Compare Profiles", "📰 Market News", "💾 Saved Portfolios", "📘 Strategy Guide"]
-)
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "🧮 Calculator", "📈 Backtest & Risk", "🌐 Efficient Frontier", "🔥 Correlation Heatmap",
+    "⚖️ Compare Profiles", "📰 Market News", "💾 Saved Portfolios", "📘 Strategy Guide"
+])
 
 
 # =======================================================================
@@ -343,13 +501,10 @@ with tab1:
     calculate = st.button("Calculate Portfolio")
 
     st.divider()
-
     score, as_of, vix_level = market_condition_score(str(date.today()))
-
     m1, m2, m3 = st.columns(3)
     with m1:
-        st.metric("Market Condition Score", f"{score:+.2f}" if score is not None else "N/A",
-                   help="Range: -1 (risk-off) to +1 (risk-on)")
+        st.metric("Market Condition Score", f"{score:+.2f}" if score is not None else "N/A")
     with m2:
         st.metric("As-of Date (9:00 AM open)", as_of if score is not None else "unavailable")
     with m3:
@@ -364,14 +519,45 @@ with tab1:
         st.session_state.current_horizon = horizon
 
     if st.session_state.current_weights:
-        weights = st.session_state.current_weights
+        weights = dict(st.session_state.current_weights)
 
+        st.divider()
+        st.subheader("➕ Add a Custom Ticker")
+        st.caption("Search any North American ticker (e.g. AAPL, SHOP.TO, TSLA) to add it as its own holding.")
+        cc1, cc2 = st.columns([2, 1])
+        with cc1:
+            custom_ticker_input = st.text_input("Ticker symbol", placeholder="e.g. AAPL")
+        with cc2:
+            if st.button("Add Ticker") and custom_ticker_input.strip():
+                is_valid, display_name = validate_ticker(custom_ticker_input.strip().upper())
+                if is_valid:
+                    key = f"custom_{custom_ticker_input.strip().upper()}"
+                    st.session_state.custom_tickers[key] = {"ticker": custom_ticker_input.strip().upper(), "name": display_name}
+                    st.success(f"Added {display_name} ({custom_ticker_input.strip().upper()})")
+                else:
+                    st.error(f"Couldn't validate ticker '{custom_ticker_input.strip().upper()}' — check the symbol and try again.")
+
+        if st.session_state.custom_tickers:
+            st.caption("Custom tickers added: " + ", ".join(v["ticker"] for v in st.session_state.custom_tickers.values()))
+            if st.button("Clear custom tickers"):
+                st.session_state.custom_tickers = {}
+                st.rerun()
+
+        # Build combined tickers map (base + custom)
+        combined_tickers = dict(TICKERS)
+        combined_labels = dict(ASSET_LABELS)
+        for key, v in st.session_state.custom_tickers.items():
+            combined_tickers[key] = v["ticker"]
+            combined_labels[key] = f"{v['name']} ({v['ticker']})"
+            if key not in weights:
+                weights[key] = 0.0
+
+        st.divider()
         st.subheader("Recommended Allocation")
         left, right = st.columns([1, 1.3])
         with left:
             fig = go.Figure(data=[go.Pie(
-                labels=[ASSET_LABELS[k] for k in weights],
-                values=[v * 100 for v in weights.values()],
+                labels=[combined_labels[k] for k in weights], values=[v * 100 for v in weights.values()],
                 hole=0.45, textinfo="label+percent",
             )])
             fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
@@ -379,8 +565,8 @@ with tab1:
             st.plotly_chart(fig, use_container_width=True, key="calc_pie")
         with right:
             df = pd.DataFrame({
-                "Asset Class": [ASSET_LABELS[k] for k in weights],
-                "Ticker": [TICKERS[k] or "—" for k in weights],
+                "Asset Class": [combined_labels[k] for k in weights],
+                "Ticker": [combined_tickers[k] or "—" for k in weights],
                 "Weight": [f"{v*100:.1f}%" for v in weights.values()],
                 "Dollar Amount": [f"${amount * v:,.2f}" for v in weights.values()],
             })
@@ -389,36 +575,69 @@ with tab1:
 
         st.divider()
         st.subheader("✏️ Manually Override Weights")
-        st.caption("Adjust sliders below, then click 'Apply Manual Weights.' They'll auto-normalize to sum to 100%.")
-
         manual_weights = {}
         cols = st.columns(4)
         for i, k in enumerate(weights):
             with cols[i % 4]:
-                manual_weights[k] = st.slider(ASSET_LABELS[k], 0, 100, int(round(weights[k] * 100)), key=f"slider_{k}")
-
+                manual_weights[k] = st.slider(combined_labels[k], 0, 100, int(round(weights[k] * 100)), key=f"slider_{k}")
         raw_total = sum(manual_weights.values())
-        if raw_total > 0:
-            normalized_manual = {k: v / raw_total for k, v in manual_weights.items()}
-        else:
-            normalized_manual = weights
-
+        normalized_manual = {k: v / raw_total for k, v in manual_weights.items()} if raw_total > 0 else weights
         st.caption(f"Raw slider total: {raw_total}% (auto-normalized to 100% on apply)")
-
         if st.button("Apply Manual Weights"):
             st.session_state.current_weights = normalized_manual
-            st.success("Manual weights applied — recommended allocation above is now overridden.")
+            st.success("Manual weights applied.")
             st.rerun()
+
+        st.divider()
+        st.subheader("✅ Data Validation")
+        issues = []
+        if abs(sum(weights.values()) - 1.0) > 0.01:
+            issues.append(f"Weights sum to {sum(weights.values())*100:.1f}%, not 100%.")
+        if amount <= 0:
+            issues.append("Investment amount must be greater than zero.")
+        for k, t in combined_tickers.items():
+            if t is not None and k in weights and weights[k] > 0:
+                is_valid, _ = validate_ticker(t)
+                if not is_valid:
+                    issues.append(f"Ticker '{t}' could not be validated — data may be unavailable.")
+        if issues:
+            for issue in issues:
+                st.warning(issue)
+        else:
+            st.success("All checks passed — weights sum to 100%, amount is valid, and all tickers resolved.")
+
+        st.divider()
+        st.subheader("🛑 Stop-Loss Threshold")
+        stop_loss_pct = st.number_input("Stop-loss (% decline from peak value)", min_value=0.0, max_value=100.0,
+                                         value=st.session_state.stop_loss_pct or 15.0, step=1.0)
+        st.session_state.stop_loss_pct = stop_loss_pct
+        st.caption("Used on the Backtest tab to flag whether this threshold would have been breached historically.")
+
+        st.divider()
+        st.subheader("📤 Export")
+        exp1, exp2 = st.columns(2)
+        with exp1:
+            csv_bytes = build_csv(weights, amount, combined_labels, combined_tickers)
+            st.download_button("Download CSV", csv_bytes, file_name="portpicker_allocation.csv", mime="text/csv")
+        with exp2:
+            try:
+                pdf_bytes = build_pdf(weights, amount, risk_choice, horizon, combined_labels, combined_tickers)
+                st.download_button("Download PDF", pdf_bytes, file_name="portpicker_allocation.pdf", mime="application/pdf")
+            except Exception as e:
+                st.error(f"PDF export failed: {e}")
 
         st.divider()
         st.subheader("💾 Save This Portfolio")
         save_name = st.text_input("Portfolio name", placeholder="e.g. My Growth Mix")
         if st.button("Save Portfolio"):
             if save_name.strip():
-                save_portfolio(save_name.strip(), amount, risk_choice, horizon, weights)
-                st.success(f"Saved '{save_name}' — view it under the Saved Portfolios tab.")
+                save_portfolio(username, save_name.strip(), amount, risk_choice, horizon, weights, stop_loss_pct)
+                st.success(f"Saved '{save_name}' to your account.")
             else:
                 st.warning("Give your portfolio a name first.")
+
+        st.session_state["_combined_tickers"] = combined_tickers
+        st.session_state["_combined_labels"] = combined_labels
 
 
 # =======================================================================
@@ -430,12 +649,16 @@ with tab2:
         st.info("Calculate a portfolio on the Calculator tab first.")
     else:
         weights = st.session_state.current_weights
+        tickers_map = st.session_state.get("_combined_tickers", TICKERS)
         bt_years = st.radio("Lookback period", [1, 5, 10], index=1, horizontal=True, format_func=lambda y: f"{y} year{'s' if y > 1 else ''}")
 
         if st.button("Run Backtest"):
             with st.spinner("Pulling historical data..."):
-                result = run_backtest(weights, bt_years)
+                result = run_backtest(weights, tickers_map, bt_years, st.session_state.stop_loss_pct)
+            st.session_state["_last_backtest"] = result
 
+        result = st.session_state.get("_last_backtest")
+        if result:
             if "error" in result:
                 st.error(f"Backtest unavailable: {result['error']}")
             else:
@@ -445,8 +668,7 @@ with tab2:
                 fig.add_trace(go.Scatter(x=result["bench_cumulative"].index, y=result["bench_cumulative"],
                                           name="60/40 Benchmark", line=dict(color="#95a5a6", width=2, dash="dash")))
                 fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                   font=dict(color="#e8eaed"), legend=dict(orientation="h"),
-                                   yaxis_title="Growth of $100")
+                                   font=dict(color="#e8eaed"), legend=dict(orientation="h"), yaxis_title="Growth of $100")
                 st.plotly_chart(fig, use_container_width=True)
 
                 c1, c2 = st.columns(2)
@@ -455,108 +677,164 @@ with tab2:
                     st.metric("Annualized Return", f"{result['ann_return']*100:.2f}%")
                     st.metric("Annualized Volatility", f"{result['ann_vol']*100:.2f}%")
                     st.metric("Sharpe Ratio", f"{result['sharpe']:.2f}")
+                    st.metric("Max Drawdown", f"{result['max_drawdown']*100:.2f}%")
                 with c2:
                     st.markdown("**60/40 Benchmark**")
                     st.metric("Annualized Return", f"{result['bench_ann_return']*100:.2f}%")
                     st.metric("Annualized Volatility", f"{result['bench_ann_vol']*100:.2f}%")
                     st.metric("Sharpe Ratio", f"{result['bench_sharpe']:.2f}")
 
+                st.divider()
+                if result["stop_loss_breach_date"]:
+                    st.error(f"⚠️ Your stop-loss threshold of {st.session_state.stop_loss_pct:.0f}% would have been breached on {result['stop_loss_breach_date']} (max drawdown over this period: {result['max_drawdown']*100:.1f}%).")
+                else:
+                    st.success(f"✅ Your stop-loss threshold of {st.session_state.stop_loss_pct:.0f}% was not breached over this period (max drawdown: {result['max_drawdown']*100:.1f}%).")
+
                 st.caption(f"Sharpe ratio assumes a {RISK_FREE_RATE*100:.1f}% annualized risk-free rate. Past performance is not indicative of future results.")
 
 
 # =======================================================================
-# TAB 3 — COMPARE PROFILES
+# TAB 3 — EFFICIENT FRONTIER
 # =======================================================================
 with tab3:
+    st.subheader("Efficient Frontier (Monte Carlo)")
+    st.caption("Simulates thousands of random portfolios across your held asset classes to show the risk/return tradeoff, with the max-Sharpe portfolio highlighted.")
+
+    if not st.session_state.current_weights:
+        st.info("Calculate a portfolio on the Calculator tab first.")
+    else:
+        result = st.session_state.get("_last_backtest")
+        if not result or "daily_returns" not in result:
+            st.info("Run a backtest on the 'Backtest & Risk' tab first — the frontier uses that same historical data.")
+        else:
+            if st.button("Generate Efficient Frontier"):
+                with st.spinner("Simulating portfolios..."):
+                    sim_results, asset_names, optimal_weights, opt_return, opt_vol = compute_efficient_frontier(result["daily_returns"])
+                    st.session_state["_frontier"] = (sim_results, asset_names, optimal_weights, opt_return, opt_vol)
+
+            if "_frontier" in st.session_state:
+                sim_results, asset_names, optimal_weights, opt_return, opt_vol = st.session_state["_frontier"]
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=sim_results[0], y=sim_results[1], mode="markers",
+                    marker=dict(size=4, color=sim_results[2], colorscale="Viridis", showscale=True, colorbar=dict(title="Sharpe")),
+                    name="Simulated Portfolios",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[opt_vol], y=[opt_return], mode="markers",
+                    marker=dict(size=16, color="red", symbol="star"), name="Max-Sharpe Portfolio",
+                ))
+                fig.update_layout(
+                    xaxis_title="Annualized Volatility", yaxis_title="Annualized Return",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("**Max-Sharpe Portfolio Weights**")
+                opt_df = pd.DataFrame({"Asset": asset_names, "Weight": [f"{w*100:.1f}%" for w in optimal_weights]})
+                st.dataframe(opt_df, use_container_width=True, hide_index=True)
+                st.caption(f"Annualized Return: {opt_return*100:.2f}%  |  Annualized Volatility: {opt_vol*100:.2f}%")
+
+
+# =======================================================================
+# TAB 4 — CORRELATION HEATMAP
+# =======================================================================
+with tab4:
+    st.subheader("Correlation Heatmap")
+    st.caption("How your held asset classes move relative to each other, based on daily returns over the selected backtest period.")
+
+    result = st.session_state.get("_last_backtest")
+    if not result or "daily_returns" not in result:
+        st.info("Run a backtest on the 'Backtest & Risk' tab first — the heatmap uses that same historical data.")
+    else:
+        corr = result["daily_returns"].corr()
+        fig = go.Figure(data=go.Heatmap(
+            z=corr.values, x=corr.columns, y=corr.columns,
+            colorscale="RdBu", zmid=0, text=corr.round(2).values, texttemplate="%{text}",
+        ))
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"), height=500)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Values near +1 move together; values near -1 move oppositely; values near 0 are uncorrelated (good for diversification).")
+
+
+# =======================================================================
+# TAB 5 — COMPARE PROFILES
+# =======================================================================
+with tab5:
     st.subheader("Compare All Risk Profiles")
     compare_amount = st.number_input("Amount for comparison ($)", min_value=1.0, value=20000.0, step=500.0, key="compare_amount")
     compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=99, value=10, key="compare_horizon")
 
     score, as_of, _ = market_condition_score(str(date.today()))
-
     cols = st.columns(3)
     for i, profile in enumerate(RiskProfile):
         w = build_portfolio(profile, compare_horizon, score)
         with cols[i]:
             st.markdown(f"**{profile.value}**")
-            fig = go.Figure(data=[go.Pie(
-                labels=[ASSET_LABELS[k] for k in w], values=[v * 100 for v in w.values()],
-                hole=0.45, textinfo="percent",
-            )])
+            fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in w], values=[v * 100 for v in w.values()],
+                                          hole=0.45, textinfo="percent")])
             fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),
                                paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
             st.plotly_chart(fig, use_container_width=True, key=f"compare_pie_{i}")
-            df = pd.DataFrame({
-                "Asset": [ASSET_LABELS[k] for k in w],
-                "Weight": [f"{v*100:.1f}%" for v in w.values()],
-                "$": [f"${compare_amount*v:,.0f}" for v in w.values()],
-            })
+            df = pd.DataFrame({"Asset": [ASSET_LABELS[k] for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
+                                "$": [f"${compare_amount*v:,.0f}" for v in w.values()]})
             st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # =======================================================================
-# TAB 4 — MARKET NEWS
+# TAB 6 — MARKET NEWS
 # =======================================================================
-with tab4:
+with tab6:
     st.subheader("Recent News by Asset Class")
-    st.caption("Headlines pulled live per representative ticker. Click through to read the full article at the source.")
-
-    news_by_class = fetch_news_for_asset_classes()
+    tickers_map = st.session_state.get("_combined_tickers", TICKERS)
+    labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
+    news_by_class = fetch_news_for_asset_classes(tickers_map)
     for key, headlines in news_by_class.items():
-        st.markdown(f"**{ASSET_LABELS[key]}** ({TICKERS[key]})")
+        st.markdown(f"**{labels_map.get(key,key)}** ({tickers_map[key]})")
         if not headlines:
             st.caption("No recent headlines available.")
         else:
             for h in headlines:
                 pub = f" — *{h['publisher']}*" if h["publisher"] else ""
-                if h["link"]:
-                    st.markdown(f"- [{h['title']}]({h['link']}){pub}")
-                else:
-                    st.markdown(f"- {h['title']}{pub}")
+                st.markdown(f"- [{h['title']}]({h['link']}){pub}" if h["link"] else f"- {h['title']}{pub}")
         st.markdown("")
 
 
 # =======================================================================
-# TAB 5 — SAVED PORTFOLIOS
+# TAB 7 — SAVED PORTFOLIOS
 # =======================================================================
-with tab5:
-    st.subheader("Saved Portfolios")
-    portfolios = load_saved_portfolios()
-
+with tab7:
+    st.subheader("Your Saved Portfolios")
+    portfolios = load_saved_portfolios(username)
     if not portfolios:
         st.info("No saved portfolios yet — save one from the Calculator tab.")
     else:
         for i, p in enumerate(portfolios):
-            with st.expander(f"**{p['name']}** — saved {p['date_saved']} ({p['risk_profile']}, {p['horizon']}yr, ${p['amount']:,.0f})"):
+            sl = f", stop-loss {p['stop_loss']:.0f}%" if p.get("stop_loss") else ""
+            with st.expander(f"**{p['name']}** — saved {p['date_saved']} ({p['risk_profile']}, {p['horizon']}yr, ${p['amount']:,.0f}{sl})"):
                 w = p["weights"]
-                df = pd.DataFrame({
-                    "Asset": [ASSET_LABELS.get(k, k) for k in w],
-                    "Weight": [f"{v*100:.1f}%" for v in w.values()],
-                    "$": [f"${p['amount']*v:,.0f}" for v in w.values()],
-                })
+                df = pd.DataFrame({"Asset": [ASSET_LABELS.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
+                                    "$": [f"${p['amount']*v:,.0f}" for v in w.values()]})
                 st.dataframe(df, use_container_width=True, hide_index=True)
                 if st.button("Delete", key=f"delete_{i}"):
-                    delete_portfolio(i)
+                    delete_portfolio(username, i)
                     st.rerun()
 
 
 # =======================================================================
-# TAB 6 — STRATEGY GUIDE
+# TAB 8 — STRATEGY GUIDE
 # =======================================================================
-with tab6:
+with tab8:
     st.subheader("Strategy Breakdown by Risk Profile")
-
     for profile in RiskProfile:
         notes = STRATEGY_NOTES[profile]
         mix = STRATEGIC_MIX[profile]
-
         with st.expander(f"**{profile.value}** — {notes['summary']}", expanded=(profile == RiskProfile.NEUTRAL)):
             c1, c2 = st.columns([1, 1.4])
             with c1:
-                fig = go.Figure(data=[go.Pie(
-                    labels=[ASSET_LABELS[k] for k in mix], values=[v * 100 for v in mix.values()],
-                    hole=0.45, textinfo="label+percent",
-                )])
+                fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in mix], values=[v * 100 for v in mix.values()],
+                                              hole=0.45, textinfo="label+percent")])
                 fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
                                    paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"), height=280)
                 st.plotly_chart(fig, use_container_width=True, key=f"strategy_pie_{profile.value}")
@@ -570,6 +848,5 @@ with tab6:
         **How the tactical tilt works:** Each profile's weights above are the *strategic* baseline.
         On the Calculator tab, two things nudge the final allocation within a ±15% range:
         - **Horizon** — longer horizons tilt toward equities/REITs, shorter horizons tilt toward safety
-        - **Market conditions** — calculated from the previous trading day's VIX level and
-          S&P 500 momentum at market open
+        - **Market conditions** — calculated from the previous trading day's VIX level and S&P 500 momentum at market open
     """)

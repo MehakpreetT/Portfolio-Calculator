@@ -5,5 +5,6 @@ plotly
 numpy
 scipy
 streamlit-authenticator
+streamlit-option-menu
 fpdf2
 pyyaml

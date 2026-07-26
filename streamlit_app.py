@@ -123,24 +123,28 @@ def load_or_create_user_config():
         st.stop()
 
     if not os.path.exists(USERS_FILE):
-        test_password_hash = stauth.Hasher().hash("test1234")
         config = {
-            "credentials": {
-                "usernames": {
-                    "testuser": {
-                        "email": "test@portpicker.demo",
-                        "name": "Test User",
-                        "password": test_password_hash,
-                    }
-                }
-            },
+            "credentials": {"usernames": {}},
             "cookie": {"name": "portpicker_auth", "key": cookie_key, "expiry_days": 30},
         }
         with open(USERS_FILE, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
+
     with open(USERS_FILE, "r") as f:
         loaded = yaml.load(f, Loader=SafeLoader)
     loaded["cookie"]["key"] = cookie_key  # always use the current secret, even if users.yaml predates it
+
+    # Self-healing: ensure the test account exists even if users.yaml was created
+    # by an earlier version of this app that didn't seed one.
+    if "testuser" not in loaded["credentials"]["usernames"]:
+        loaded["credentials"]["usernames"]["testuser"] = {
+            "email": "test@portpicker.demo",
+            "name": "Test User",
+            "password": stauth.Hasher().hash("test1234"),
+        }
+        with open(USERS_FILE, "w") as f:
+            yaml.dump(loaded, f, default_flow_style=False)
+
     return loaded
 
 

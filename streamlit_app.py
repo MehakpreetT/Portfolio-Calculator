@@ -3,30 +3,22 @@ PortPicker — Forward-Looking Portfolio Construction Web App
 --------------------------------------------------------------
 Run locally with:  streamlit run streamlit_app.py
 
-Login: first run auto-creates a default account file (users.yaml).
-Register a new account from the login screen's "Register" tab.
+Login: first run auto-creates a default account file (users.yaml) with
+a seeded test account (username: testuser, password: test1234).
+Register a new account from the Register tab shown before you log in.
 
-Tabs:
-  1. Calculator          -> build a recommended portfolio, add custom
-                            tickers, override weights, set a stop-loss,
-                            validate, and save it to your account
+Pages (left sidebar once logged in):
+  1. Calculator          -> build a portfolio, add custom tickers,
+                            override weights, set a stop-loss, validate,
+                            export, and save it to your account
   2. Backtest & Risk      -> historical performance + Sharpe ratio
-  3. Efficient Frontier   -> Monte Carlo simulated frontier vs. your portfolio
-  4. Correlation Heatmap  -> how your asset classes move relative to each other
+  3. Efficient Frontier   -> Monte Carlo frontier for YOUR current holdings,
+                            with your actual portfolio plotted on it
+  4. Portfolio Education  -> what each asset class is and why it's used
   5. Compare Profiles     -> Conservative / Neutral / Growth side-by-side
   6. Market News          -> recent headlines per asset class
   7. Saved Portfolios     -> your saved strategies (per account)
   8. Strategy Guide       -> philosophy behind each risk profile
-
-New since last version:
-  - User accounts (streamlit-authenticator) — saved portfolios are now
-    private per logged-in user instead of one shared file
-  - Efficient frontier (Monte Carlo + scipy-optimized max-Sharpe point)
-  - Correlation heatmap across all held asset classes
-  - PDF and CSV export of your current allocation
-  - Data validation panel (weight sum, ticker validity, amount sanity)
-  - Stop-loss threshold — flags if backtest drawdown would have breached it
-  - Custom ticker search — add any North American ticker as a holding
 """
 
 import streamlit as st
@@ -36,10 +28,10 @@ import numpy as np
 import plotly.graph_objects as go
 import json
 import os
-import io
 import yaml
 from yaml.loader import SafeLoader
 import streamlit_authenticator as stauth
+from streamlit_option_menu import option_menu
 from fpdf import FPDF
 from scipy.optimize import minimize
 from enum import Enum
@@ -68,25 +60,13 @@ STRATEGIC_MIX = {
 }
 
 TICKERS = {
-    "cash": None,
-    "bonds": "XBB.TO",
-    "cdn_eq": "XIC.TO",
-    "us_eq": "VFV.TO",
-    "intl_eq": "XEF.TO",
-    "em_eq": "XEC.TO",
-    "gold": "CGL.TO",
-    "reit": "XRE.TO",
+    "cash": None, "bonds": "XBB.TO", "cdn_eq": "XIC.TO", "us_eq": "VFV.TO",
+    "intl_eq": "XEF.TO", "em_eq": "XEC.TO", "gold": "CGL.TO", "reit": "XRE.TO",
 }
 
 ASSET_LABELS = {
-    "cash": "Cash",
-    "bonds": "Fixed Income",
-    "cdn_eq": "Canadian Equity",
-    "us_eq": "U.S. Equity",
-    "intl_eq": "International Equity",
-    "em_eq": "Emerging Markets",
-    "gold": "Gold / Commodities",
-    "reit": "REITs",
+    "cash": "Cash", "bonds": "Fixed Income", "cdn_eq": "Canadian Equity", "us_eq": "U.S. Equity",
+    "intl_eq": "International Equity", "em_eq": "Emerging Markets", "gold": "Gold / Commodities", "reit": "REITs",
 }
 
 TACTICAL_RANGE = 0.15
@@ -112,9 +92,44 @@ STRATEGY_NOTES = {
     },
 }
 
+EDUCATION_CONTENT = {
+    "cash": {
+        "what": "Cash and cash-equivalents (like money market funds) are the most stable, liquid holdings in a portfolio — the closest thing to zero price risk.",
+        "why": "Cash cushions the portfolio during downturns and provides dry powder to rebalance into other assets when they get cheap. It typically earns the least over time, so portfolios only hold a small amount.",
+    },
+    "bonds": {
+        "what": "Fixed income (bonds) are loans to governments or corporations that pay a set interest rate over a defined term.",
+        "why": "Bonds are less volatile than stocks and often move differently than equities, especially during stock market downturns — they're the main shock absorber in a balanced portfolio.",
+    },
+    "cdn_eq": {
+        "what": "Canadian equities are shares of Canadian companies, often concentrated in financials, energy, and materials.",
+        "why": "Gives home-market exposure and dividend income, though Canada's market is more concentrated in a few sectors than global markets.",
+    },
+    "us_eq": {
+        "what": "U.S. equities are shares of American companies, spanning the world's largest and most liquid stock market.",
+        "why": "The U.S. market offers the broadest sector diversification (especially technology and healthcare) and has historically been a strong long-term growth driver.",
+    },
+    "intl_eq": {
+        "what": "International (developed market) equities are shares of companies outside North America — mainly Europe, Japan, and Australia.",
+        "why": "Adds geographic diversification so the portfolio isn't dependent on any single country's economic cycle.",
+    },
+    "em_eq": {
+        "what": "Emerging market equities are shares of companies in developing economies like China, India, and Brazil.",
+        "why": "Offers higher long-run growth potential from faster-growing economies, at the cost of higher volatility and political/currency risk.",
+    },
+    "gold": {
+        "what": "Gold and broader commodities are physical/real assets rather than claims on a company's earnings.",
+        "why": "Gold tends to hold value during inflation or crisis periods when stocks and bonds can both struggle, making it a useful diversifier.",
+    },
+    "reit": {
+        "what": "REITs (Real Estate Investment Trusts) are companies that own and operate income-producing real estate, traded like stocks.",
+        "why": "Gives real estate exposure and steady income without directly owning property, and often behaves differently than the broader stock market.",
+    },
+}
+
 
 # =======================================================================
-# 2. USER ACCOUNTS (streamlit-authenticator)
+# 2. USER ACCOUNTS
 # =======================================================================
 def load_or_create_user_config():
     cookie_key = st.secrets.get("cookie_key", None) if hasattr(st, "secrets") else None
@@ -132,14 +147,11 @@ def load_or_create_user_config():
 
     with open(USERS_FILE, "r") as f:
         loaded = yaml.load(f, Loader=SafeLoader)
-    loaded["cookie"]["key"] = cookie_key  # always use the current secret, even if users.yaml predates it
+    loaded["cookie"]["key"] = cookie_key
 
-    # Self-healing: ensure the test account exists even if users.yaml was created
-    # by an earlier version of this app that didn't seed one.
     if "testuser" not in loaded["credentials"]["usernames"]:
         loaded["credentials"]["usernames"]["testuser"] = {
-            "email": "test@portpicker.demo",
-            "name": "Test User",
+            "email": "test@portpicker.demo", "name": "Test User",
             "password": stauth.Hasher().hash("test1234"),
         }
         with open(USERS_FILE, "w") as f:
@@ -168,13 +180,8 @@ def load_saved_portfolios(username):
 def save_portfolio(username, name, amount, risk_profile, horizon, weights, stop_loss=None):
     portfolios = load_saved_portfolios(username)
     portfolios.append({
-        "name": name,
-        "date_saved": str(date.today()),
-        "amount": amount,
-        "risk_profile": risk_profile,
-        "horizon": horizon,
-        "weights": weights,
-        "stop_loss": stop_loss,
+        "name": name, "date_saved": str(date.today()), "amount": amount,
+        "risk_profile": risk_profile, "horizon": horizon, "weights": weights, "stop_loss": stop_loss,
     })
     with open(user_portfolio_file(username), "w") as f:
         json.dump(portfolios, f, indent=2)
@@ -250,8 +257,7 @@ def build_portfolio(risk_profile, horizon_years, market_score):
             adjusted[k] = base[k] - shift * (base[k] / total_defensive_base)
 
     total = sum(adjusted.values())
-    weights = {k: v / total for k, v in adjusted.items()}
-    return weights
+    return {k: v / total for k, v in adjusted.items()}
 
 
 # =======================================================================
@@ -259,7 +265,6 @@ def build_portfolio(risk_profile, horizon_years, market_score):
 # =======================================================================
 @st.cache_data(ttl=60 * 60 * 6)
 def validate_ticker(ticker: str):
-    """Returns (is_valid, display_name) for any North American ticker."""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="5d")
@@ -309,7 +314,6 @@ def run_backtest(weights: dict, tickers_map: dict, years: int, stop_loss_pct=Non
         sharpe = (ann_return - RISK_FREE_RATE) / ann_vol if ann_vol > 0 else float("nan")
 
         cumulative = (1 + port_daily).cumprod() * 100
-
         running_max = cumulative.cummax()
         drawdown = (cumulative - running_max) / running_max
         max_drawdown = drawdown.min()
@@ -334,23 +338,22 @@ def run_backtest(weights: dict, tickers_map: dict, years: int, stop_loss_pct=Non
             "ann_return": ann_return, "ann_vol": ann_vol, "sharpe": sharpe,
             "max_drawdown": max_drawdown, "stop_loss_breach_date": stop_loss_breach_date,
             "bench_ann_return": bench_ann_return, "bench_ann_vol": bench_ann_vol, "bench_sharpe": bench_sharpe,
-            "daily_returns": daily_returns,
+            "daily_returns": daily_returns, "tickers_used": tickers_used, "weights_used": weights,
         }
     except Exception as e:
         return {"error": str(e)}
 
 
-def compute_efficient_frontier(daily_returns: pd.DataFrame, n_portfolios=3000):
+def compute_efficient_frontier(daily_returns: pd.DataFrame, weights: dict, tickers_map: dict, n_portfolios=3000):
     mean_returns = daily_returns.mean() * 252
     cov_matrix = daily_returns.cov() * 252
     n_assets = len(mean_returns)
+    tickers_order = mean_returns.index.tolist()
 
     results = np.zeros((3, n_portfolios))
-    weights_record = []
     for i in range(n_portfolios):
         w = np.random.random(n_assets)
         w /= np.sum(w)
-        weights_record.append(w)
         port_return = np.dot(w, mean_returns)
         port_vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
         sharpe = (port_return - RISK_FREE_RATE) / port_vol if port_vol > 0 else 0
@@ -358,7 +361,6 @@ def compute_efficient_frontier(daily_returns: pd.DataFrame, n_portfolios=3000):
         results[1, i] = port_return
         results[2, i] = sharpe
 
-    # Solve for max-Sharpe portfolio directly via optimizer
     def neg_sharpe(w):
         r = np.dot(w, mean_returns)
         v = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
@@ -372,7 +374,23 @@ def compute_efficient_frontier(daily_returns: pd.DataFrame, n_portfolios=3000):
     opt_return = np.dot(optimal_weights, mean_returns)
     opt_vol = np.sqrt(np.dot(optimal_weights.T, np.dot(cov_matrix, optimal_weights)))
 
-    return results, mean_returns.index.tolist(), optimal_weights, opt_return, opt_vol
+    # Map your ACTUAL held weights (by asset class) onto the ticker-ordered vector
+    # so we can plot exactly where your current portfolio sits on this same frontier.
+    your_weight_vec = np.zeros(n_assets)
+    for k, w in weights.items():
+        ticker = tickers_map.get(k)
+        if ticker in tickers_order:
+            idx = tickers_order.index(ticker)
+            your_weight_vec[idx] += w
+    non_cash_total = your_weight_vec.sum()
+    cash_weight = weights.get("cash", 0.0)
+    if non_cash_total > 0:
+        your_return = np.dot(your_weight_vec, mean_returns) + cash_weight * RISK_FREE_RATE
+        your_vol = np.sqrt(np.dot(your_weight_vec.T, np.dot(cov_matrix, your_weight_vec)))
+    else:
+        your_return, your_vol = None, None
+
+    return results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol
 
 
 # =======================================================================
@@ -446,68 +464,92 @@ st.set_page_config(page_title="PortPicker", page_icon="📊", layout="wide")
 st.markdown("""
     <style>
         .main { background-color: #0e1117; }
-        h1, h2, h3 { color: #e8eaed; }
-        .stButton>button {
-            background-color: #2c3e50; color: white; border-radius: 8px;
-            font-weight: 600; padding: 0.5em 1.5em;
+        h1, h2, h3 { color: #e8eaed; letter-spacing: -0.3px; }
+        [data-testid="stMetricValue"] { color: #e8eaed; }
+        [data-testid="stMetric"] {
+            background-color: #171b24; border: 1px solid #2b2f38;
+            border-radius: 10px; padding: 12px 16px;
         }
-        .stButton>button:hover { background-color: #34495e; color: white; }
+        .stButton>button {
+            background-color: #2563eb; color: white; border: none; border-radius: 8px;
+            font-weight: 600; padding: 0.5em 1.5em; transition: background-color 0.15s ease;
+        }
+        .stButton>button:hover { background-color: #1d4ed8; color: white; }
+        .stDownloadButton>button {
+            background-color: #1f2937; color: white; border: 1px solid #374151; border-radius: 8px;
+        }
+        section[data-testid="stSidebar"] { background-color: #10131a; border-right: 1px solid #232733; }
+        .edu-card {
+            background-color: #171b24; border: 1px solid #2b2f38; border-radius: 10px;
+            padding: 16px 20px; margin-bottom: 14px;
+        }
+        .edu-card h4 { margin: 0 0 8px 0; color: #60a5fa; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- Authentication ---
 config = load_or_create_user_config()
 authenticator = stauth.Authenticate(
     config["credentials"], config["cookie"]["name"], config["cookie"]["key"], config["cookie"]["expiry_days"]
 )
 
-st.title("📊 PortPicker")
-
-login_tab, register_tab = st.tabs(["Login", "Register"])
-with login_tab:
-    authenticator.login()
-with register_tab:
-    try:
-        email, username, name = authenticator.register_user(pre_authorized=None)
-        if email:
-            save_user_config(config)
-            st.success("Account created — please log in from the Login tab.")
-    except Exception as e:
-        st.error(str(e))
-
-if st.session_state.get("authentication_status") is False:
-    st.error("Username or password is incorrect.")
-    st.stop()
-elif st.session_state.get("authentication_status") is None:
-    st.info("Log in or register above to build and save portfolios.")
+# --- Login gate: only show login/register UI when NOT authenticated ---
+if not st.session_state.get("authentication_status"):
+    st.title("📊 PortPicker")
+    st.caption("Log in or create an account to build and save portfolios.")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+    with login_tab:
+        authenticator.login()
+        if st.session_state.get("authentication_status") is False:
+            st.error("Username or password is incorrect.")
+    with register_tab:
+        try:
+            email, username, name = authenticator.register_user(pre_authorized=None)
+            if email:
+                save_user_config(config)
+                st.success("Account created — please log in from the Login tab.")
+        except Exception as e:
+            st.error(str(e))
     st.stop()
 
-# --- Logged in from here on ---
+# =======================================================================
+# LOGGED IN FROM HERE ON — login/register UI is fully hidden
+# =======================================================================
 username = st.session_state["username"]
-with st.sidebar:
-    st.write(f"Logged in as **{st.session_state['name']}**")
-    authenticator.logout()
 
-st.caption("Builds a target asset allocation from your risk profile, horizon, and the prior trading day's market conditions.")
-
-# --- Session state defaults ---
 for key, default in [
     ("current_weights", None), ("current_amount", 20000.0), ("current_risk", RiskProfile.NEUTRAL.value),
-    ("current_horizon", 10), ("custom_tickers", {}), ("stop_loss_pct", None),
+    ("current_horizon", 10), ("custom_tickers", {}), ("stop_loss_pct", 15.0), ("is_customized", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "🧮 Calculator", "📈 Backtest & Risk", "🌐 Efficient Frontier", "🔥 Correlation Heatmap",
-    "⚖️ Compare Profiles", "📰 Market News", "💾 Saved Portfolios", "📘 Strategy Guide"
-])
+with st.sidebar:
+    st.markdown(f"### 📊 PortPicker")
+    st.write(f"Logged in as **{st.session_state['name']}**")
+    authenticator.logout()
+    st.divider()
+    page = option_menu(
+        menu_title=None,
+        options=["Calculator", "Backtest & Risk", "Efficient Frontier", "Portfolio Education",
+                 "Compare Profiles", "Market News", "Saved Portfolios", "Strategy Guide"],
+        icons=["calculator", "graph-up-arrow", "bullseye", "mortarboard",
+               "bar-chart-steps", "newspaper", "save", "book"],
+        default_index=0,
+        styles={
+            "container": {"padding": "0", "background-color": "#10131a"},
+            "icon": {"color": "#60a5fa", "font-size": "16px"},
+            "nav-link": {"font-size": "14px", "color": "#c9ccd3", "--hover-color": "#1a1e29"},
+            "nav-link-selected": {"background-color": "#1d4ed8"},
+        },
+    )
+
+st.caption("Builds a target asset allocation from your risk profile, horizon, and the prior trading day's market conditions.")
 
 
 # =======================================================================
-# TAB 1 — CALCULATOR
+# PAGE: CALCULATOR
 # =======================================================================
-with tab1:
+if page == "Calculator":
     col1, col2, col3 = st.columns(3)
     with col1:
         amount = st.number_input("Investment Amount ($)", min_value=1.0, value=st.session_state.current_amount, step=500.0)
@@ -537,6 +579,7 @@ with tab1:
         st.session_state.current_amount = amount
         st.session_state.current_risk = risk_choice
         st.session_state.current_horizon = horizon
+        st.session_state.is_customized = False
 
     if st.session_state.current_weights:
         weights = dict(st.session_state.current_weights)
@@ -546,34 +589,56 @@ with tab1:
         st.caption("Search any North American ticker (e.g. AAPL, SHOP.TO, TSLA) to add it as its own holding.")
         cc1, cc2 = st.columns([2, 1])
         with cc1:
-            custom_ticker_input = st.text_input("Ticker symbol", placeholder="e.g. AAPL")
+            custom_ticker_input = st.text_input("Ticker symbol", placeholder="e.g. AAPL", key="custom_ticker_box")
         with cc2:
-            if st.button("Add Ticker") and custom_ticker_input.strip():
-                is_valid, display_name = validate_ticker(custom_ticker_input.strip().upper())
+            add_clicked = st.button("Add Ticker")
+        if add_clicked:
+            cleaned = (custom_ticker_input or "").strip().upper()
+            if not cleaned:
+                st.warning("Type a ticker symbol first.")
+            else:
+                is_valid, display_name = validate_ticker(cleaned)
                 if is_valid:
-                    key = f"custom_{custom_ticker_input.strip().upper()}"
-                    st.session_state.custom_tickers[key] = {"ticker": custom_ticker_input.strip().upper(), "name": display_name}
-                    st.success(f"Added {display_name} ({custom_ticker_input.strip().upper()})")
+                    key = f"custom_{cleaned}"
+                    st.session_state.custom_tickers[key] = {"ticker": cleaned, "name": display_name}
+                    st.session_state.current_weights[key] = 0.05
+                    st.session_state.is_customized = True
+                    st.success(f"Added {display_name} ({cleaned})")
+                    st.rerun()
                 else:
-                    st.error(f"Couldn't validate ticker '{custom_ticker_input.strip().upper()}' — check the symbol and try again.")
+                    st.error(f"Couldn't validate ticker '{cleaned}' — check the symbol and try again.")
 
         if st.session_state.custom_tickers:
             st.caption("Custom tickers added: " + ", ".join(v["ticker"] for v in st.session_state.custom_tickers.values()))
             if st.button("Clear custom tickers"):
+                # Remove custom keys from BOTH custom_tickers and current_weights so
+                # nothing downstream tries to look up a label/ticker that no longer exists.
+                removed_keys = list(st.session_state.custom_tickers.keys())
                 st.session_state.custom_tickers = {}
+                if st.session_state.current_weights:
+                    for k in removed_keys:
+                        st.session_state.current_weights.pop(k, None)
+                    total = sum(st.session_state.current_weights.values())
+                    if total > 0:
+                        st.session_state.current_weights = {k: v / total for k, v in st.session_state.current_weights.items()}
+                st.session_state.is_customized = True
                 st.rerun()
 
-        # Build combined tickers map (base + custom)
+        # Build combined tickers/labels map (base + custom) — use dict copies so a
+        # ticker removed from custom_tickers can never leave a stale label lookup.
         combined_tickers = dict(TICKERS)
         combined_labels = dict(ASSET_LABELS)
         for key, v in st.session_state.custom_tickers.items():
             combined_tickers[key] = v["ticker"]
             combined_labels[key] = f"{v['name']} ({v['ticker']})"
-            if key not in weights:
-                weights[key] = 0.0
+
+        # Defensive filter: drop any weight key that doesn't resolve to a known
+        # label (guards against any future desync between the two dicts).
+        weights = {k: v for k, v in weights.items() if k in combined_labels}
 
         st.divider()
-        st.subheader("Recommended Allocation")
+        heading = "Your Custom Allocation" if st.session_state.is_customized else "Recommended Allocation"
+        st.subheader(heading)
         left, right = st.columns([1, 1.3])
         with left:
             fig = go.Figure(data=[go.Pie(
@@ -586,7 +651,7 @@ with tab1:
         with right:
             df = pd.DataFrame({
                 "Asset Class": [combined_labels[k] for k in weights],
-                "Ticker": [combined_tickers[k] or "—" for k in weights],
+                "Ticker": [combined_tickers.get(k) or "—" for k in weights],
                 "Weight": [f"{v*100:.1f}%" for v in weights.values()],
                 "Dollar Amount": [f"${amount * v:,.2f}" for v in weights.values()],
             })
@@ -605,6 +670,7 @@ with tab1:
         st.caption(f"Raw slider total: {raw_total}% (auto-normalized to 100% on apply)")
         if st.button("Apply Manual Weights"):
             st.session_state.current_weights = normalized_manual
+            st.session_state.is_customized = True
             st.success("Manual weights applied.")
             st.rerun()
 
@@ -629,7 +695,7 @@ with tab1:
         st.divider()
         st.subheader("🛑 Stop-Loss Threshold")
         stop_loss_pct = st.number_input("Stop-loss (% decline from peak value)", min_value=0.0, max_value=100.0,
-                                         value=st.session_state.stop_loss_pct or 15.0, step=1.0)
+                                         value=st.session_state.stop_loss_pct, step=1.0)
         st.session_state.stop_loss_pct = stop_loss_pct
         st.caption("Used on the Backtest tab to flag whether this threshold would have been breached historically.")
 
@@ -658,15 +724,16 @@ with tab1:
 
         st.session_state["_combined_tickers"] = combined_tickers
         st.session_state["_combined_labels"] = combined_labels
+        st.session_state["current_weights"] = weights
 
 
 # =======================================================================
-# TAB 2 — BACKTEST & RISK
+# PAGE: BACKTEST & RISK
 # =======================================================================
-with tab2:
+elif page == "Backtest & Risk":
     st.subheader("Historical Backtest")
     if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator tab first.")
+        st.info("Calculate a portfolio on the Calculator page first.")
     else:
         weights = st.session_state.current_weights
         tickers_map = st.session_state.get("_combined_tickers", TICKERS)
@@ -714,26 +781,37 @@ with tab2:
 
 
 # =======================================================================
-# TAB 3 — EFFICIENT FRONTIER
+# PAGE: EFFICIENT FRONTIER
 # =======================================================================
-with tab3:
+elif page == "Efficient Frontier":
     st.subheader("Efficient Frontier (Monte Carlo)")
-    st.caption("Simulates thousands of random portfolios across your held asset classes to show the risk/return tradeoff, with the max-Sharpe portfolio highlighted.")
 
     if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator tab first.")
+        st.info("Calculate a portfolio on the Calculator page first.")
     else:
         result = st.session_state.get("_last_backtest")
         if not result or "daily_returns" not in result:
-            st.info("Run a backtest on the 'Backtest & Risk' tab first — the frontier uses that same historical data.")
+            st.info("Run a backtest on the 'Backtest & Risk' page first — the frontier uses that same historical data.")
         else:
+            labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
+            held_names = [labels_map.get(k, k) for k, w in st.session_state.current_weights.items() if w > 0]
+            st.caption(
+                f"Frontier for: **{st.session_state.current_risk} profile, ${st.session_state.current_amount:,.0f}, "
+                f"{st.session_state.current_horizon}yr horizon** — simulated using your currently held assets "
+                f"({', '.join(held_names)}) over the same lookback period as your last backtest. "
+                f"3,000 random-weight portfolios are simulated across these assets; cash is excluded from the "
+                f"simulation itself (it has no price series) but is folded into the risk-free contribution."
+            )
+
             if st.button("Generate Efficient Frontier"):
                 with st.spinner("Simulating portfolios..."):
-                    sim_results, asset_names, optimal_weights, opt_return, opt_vol = compute_efficient_frontier(result["daily_returns"])
-                    st.session_state["_frontier"] = (sim_results, asset_names, optimal_weights, opt_return, opt_vol)
+                    tickers_map_for_frontier = st.session_state.get("_combined_tickers", TICKERS)
+                    sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol = \
+                        compute_efficient_frontier(result["daily_returns"], result["weights_used"], tickers_map_for_frontier)
+                    st.session_state["_frontier"] = (sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol)
 
             if "_frontier" in st.session_state:
-                sim_results, asset_names, optimal_weights, opt_return, opt_vol = st.session_state["_frontier"]
+                sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol = st.session_state["_frontier"]
 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
@@ -745,43 +823,70 @@ with tab3:
                     x=[opt_vol], y=[opt_return], mode="markers",
                     marker=dict(size=16, color="red", symbol="star"), name="Max-Sharpe Portfolio",
                 ))
+                if your_return is not None:
+                    fig.add_trace(go.Scatter(
+                        x=[your_vol], y=[your_return], mode="markers",
+                        marker=dict(size=16, color="#e8eaed", symbol="diamond", line=dict(color="black", width=1)),
+                        name="Your Current Portfolio",
+                    ))
                 fig.update_layout(
                     xaxis_title="Annualized Volatility", yaxis_title="Annualized Return",
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"),
+                    legend=dict(orientation="h"),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                st.markdown("**Max-Sharpe Portfolio Weights**")
-                opt_df = pd.DataFrame({"Asset": asset_names, "Weight": [f"{w*100:.1f}%" for w in optimal_weights]})
+                if your_return is not None:
+                    st.info(f"**Your Current Portfolio** sits at {your_vol*100:.2f}% volatility / {your_return*100:.2f}% return — "
+                            f"the white diamond on the chart above.")
+
+                st.markdown("**Max-Sharpe Portfolio Weights** (ticker-level, unconstrained by your risk profile)")
+                opt_df = pd.DataFrame({"Ticker": tickers_order, "Weight": [f"{w*100:.1f}%" for w in optimal_weights]})
                 st.dataframe(opt_df, use_container_width=True, hide_index=True)
                 st.caption(f"Annualized Return: {opt_return*100:.2f}%  |  Annualized Volatility: {opt_vol*100:.2f}%")
 
 
 # =======================================================================
-# TAB 4 — CORRELATION HEATMAP
+# PAGE: PORTFOLIO EDUCATION
 # =======================================================================
-with tab4:
-    st.subheader("Correlation Heatmap")
-    st.caption("How your held asset classes move relative to each other, based on daily returns over the selected backtest period.")
+elif page == "Portfolio Education":
+    st.subheader("How Portfolio Construction Works")
+    st.markdown("""
+    Building a portfolio comes down to five steps:
 
-    result = st.session_state.get("_last_backtest")
-    if not result or "daily_returns" not in result:
-        st.info("Run a backtest on the 'Backtest & Risk' tab first — the heatmap uses that same historical data.")
-    else:
-        corr = result["daily_returns"].corr()
-        fig = go.Figure(data=go.Heatmap(
-            z=corr.values, x=corr.columns, y=corr.columns,
-            colorscale="RdBu", zmid=0, text=corr.round(2).values, texttemplate="%{text}",
-        ))
-        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"), height=500)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Values near +1 move together; values near -1 move oppositely; values near 0 are uncorrelated (good for diversification).")
+    1. **Set an objective** — what's the money for, and when do you need it? This determines how much risk you can afford to take.
+    2. **Choose an asset allocation** — split your money across asset classes (stocks, bonds, cash, real assets) based on that objective.
+    3. **Pick the actual holdings** — select specific funds, ETFs, or securities to fill each asset class.
+    4. **Monitor and rebalance** — as markets move, your weights drift from target. Rebalancing means trimming what's grown and adding to what's lagged, to stay aligned with your original plan.
+    5. **Review the objective periodically** — your risk tolerance and time horizon change over time (e.g. getting closer to retirement), so the allocation should evolve too.
+    """)
+
+    st.divider()
+    st.subheader("Asset Classes Explained")
+    st.caption("What each holding in your portfolio actually is, and why it's included.")
+
+    for key, content in EDUCATION_CONTENT.items():
+        st.markdown(f"""
+            <div class="edu-card">
+                <h4>{ASSET_LABELS[key]}</h4>
+                <p><strong>What it is:</strong> {content['what']}</p>
+                <p><strong>Why it's used:</strong> {content['why']}</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.divider()
+    st.subheader("Why Diversify Across All of These?")
+    st.markdown("""
+    No single asset class performs best every year, and different asset classes often respond differently
+    to the same economic event (e.g. bonds can rise when stocks fall). Holding a mix smooths out the ride —
+    you give up some upside in the best years in exchange for far less pain in the worst ones.
+    """)
 
 
 # =======================================================================
-# TAB 5 — COMPARE PROFILES
+# PAGE: COMPARE PROFILES
 # =======================================================================
-with tab5:
+elif page == "Compare Profiles":
     st.subheader("Compare All Risk Profiles")
     compare_amount = st.number_input("Amount for comparison ($)", min_value=1.0, value=20000.0, step=500.0, key="compare_amount")
     compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=99, value=10, key="compare_horizon")
@@ -803,9 +908,9 @@ with tab5:
 
 
 # =======================================================================
-# TAB 6 — MARKET NEWS
+# PAGE: MARKET NEWS
 # =======================================================================
-with tab6:
+elif page == "Market News":
     st.subheader("Recent News by Asset Class")
     tickers_map = st.session_state.get("_combined_tickers", TICKERS)
     labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
@@ -822,13 +927,13 @@ with tab6:
 
 
 # =======================================================================
-# TAB 7 — SAVED PORTFOLIOS
+# PAGE: SAVED PORTFOLIOS
 # =======================================================================
-with tab7:
+elif page == "Saved Portfolios":
     st.subheader("Your Saved Portfolios")
     portfolios = load_saved_portfolios(username)
     if not portfolios:
-        st.info("No saved portfolios yet — save one from the Calculator tab.")
+        st.info("No saved portfolios yet — save one from the Calculator page.")
     else:
         for i, p in enumerate(portfolios):
             sl = f", stop-loss {p['stop_loss']:.0f}%" if p.get("stop_loss") else ""
@@ -843,9 +948,9 @@ with tab7:
 
 
 # =======================================================================
-# TAB 8 — STRATEGY GUIDE
+# PAGE: STRATEGY GUIDE
 # =======================================================================
-with tab8:
+elif page == "Strategy Guide":
     st.subheader("Strategy Breakdown by Risk Profile")
     for profile in RiskProfile:
         notes = STRATEGY_NOTES[profile]
@@ -866,7 +971,7 @@ with tab8:
     st.divider()
     st.markdown("""
         **How the tactical tilt works:** Each profile's weights above are the *strategic* baseline.
-        On the Calculator tab, two things nudge the final allocation within a ±15% range:
+        On the Calculator page, two things nudge the final allocation within a ±15% range:
         - **Horizon** — longer horizons tilt toward equities/REITs, shorter horizons tilt toward safety
         - **Market conditions** — calculated from the previous trading day's VIX level and S&P 500 momentum at market open
     """)

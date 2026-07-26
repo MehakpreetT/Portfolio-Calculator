@@ -789,61 +789,81 @@ elif page == "Efficient Frontier":
     if not st.session_state.current_weights:
         st.info("Calculate a portfolio on the Calculator page first.")
     else:
-        result = st.session_state.get("_last_backtest")
-        if not result or "daily_returns" not in result:
-            st.info("Run a backtest on the 'Backtest & Risk' page first — the frontier uses that same historical data.")
-        else:
-            labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
-            held_names = [labels_map.get(k, k) for k, w in st.session_state.current_weights.items() if w > 0]
-            st.caption(
-                f"Frontier for: **{st.session_state.current_risk} profile, ${st.session_state.current_amount:,.0f}, "
-                f"{st.session_state.current_horizon}yr horizon** — simulated using your currently held assets "
-                f"({', '.join(held_names)}) over the same lookback period as your last backtest. "
-                f"3,000 random-weight portfolios are simulated across these assets; cash is excluded from the "
-                f"simulation itself (it has no price series) but is folded into the risk-free contribution."
-            )
+        weights = st.session_state.current_weights
+        tickers_map = st.session_state.get("_combined_tickers", TICKERS)
+        labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
+        held_names = [labels_map.get(k, k) for k, w in weights.items() if w > 0]
 
-            if st.button("Generate Efficient Frontier"):
-                with st.spinner("Simulating portfolios..."):
-                    tickers_map_for_frontier = st.session_state.get("_combined_tickers", TICKERS)
+        fr_years = st.radio("Lookback period", [1, 5, 10], index=1, horizontal=True,
+                             format_func=lambda y: f"{y} year{'s' if y > 1 else ''}", key="frontier_years")
+
+        st.caption(
+            f"Frontier for: **{st.session_state.current_risk} profile, ${st.session_state.current_amount:,.0f}, "
+            f"{st.session_state.current_horizon}yr horizon** — simulated using your currently held assets "
+            f"({', '.join(held_names)}) over the selected lookback period. This always reflects whatever "
+            f"portfolio is currently active on the Calculator page, including manual overrides and custom tickers. "
+            f"3,000 random-weight portfolios are simulated across these assets; cash is excluded from the "
+            f"simulation itself (it has no price series) but is folded into the risk-free contribution."
+        )
+
+        # Fingerprint the current portfolio so a stale frontier from a different
+        # portfolio/lookback is never shown as if it were current.
+        portfolio_fingerprint = (tuple(sorted(weights.items())), tuple(sorted((k, v) for k, v in tickers_map.items())), fr_years)
+
+        if st.button("Generate Efficient Frontier"):
+            period = "1y" if fr_years <= 1 else ("5y" if fr_years <= 5 else "10y")
+            tickers_used = {k: tickers_map[k] for k in weights if tickers_map.get(k) is not None}
+            try:
+                with st.spinner("Pulling price history and simulating portfolios..."):
+                    prices = fetch_price_history(tuple(tickers_used.values()), period)
+                    daily_returns = prices.dropna().pct_change().dropna()
                     sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol = \
-                        compute_efficient_frontier(result["daily_returns"], result["weights_used"], tickers_map_for_frontier)
-                    st.session_state["_frontier"] = (sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol)
+                        compute_efficient_frontier(daily_returns, weights, tickers_map)
+                    st.session_state["_frontier"] = (
+                        sim_results, tickers_order, optimal_weights, opt_return, opt_vol,
+                        your_return, your_vol, portfolio_fingerprint
+                    )
+            except Exception as e:
+                st.error(f"Couldn't generate the frontier: {e}")
 
-            if "_frontier" in st.session_state:
-                sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol = st.session_state["_frontier"]
+        cached = st.session_state.get("_frontier")
+        if cached:
+            sim_results, tickers_order, optimal_weights, opt_return, opt_vol, your_return, your_vol, cached_fingerprint = cached
 
-                fig = go.Figure()
+            if cached_fingerprint != portfolio_fingerprint:
+                st.warning("Your portfolio has changed since this frontier was generated — click 'Generate Efficient Frontier' again to refresh it.")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=sim_results[0], y=sim_results[1], mode="markers",
+                marker=dict(size=4, color=sim_results[2], colorscale="Viridis", showscale=True, colorbar=dict(title="Sharpe")),
+                name="Simulated Portfolios",
+            ))
+            fig.add_trace(go.Scatter(
+                x=[opt_vol], y=[opt_return], mode="markers",
+                marker=dict(size=16, color="red", symbol="star"), name="Max-Sharpe Portfolio",
+            ))
+            if your_return is not None:
                 fig.add_trace(go.Scatter(
-                    x=sim_results[0], y=sim_results[1], mode="markers",
-                    marker=dict(size=4, color=sim_results[2], colorscale="Viridis", showscale=True, colorbar=dict(title="Sharpe")),
-                    name="Simulated Portfolios",
+                    x=[your_vol], y=[your_return], mode="markers",
+                    marker=dict(size=16, color="#e8eaed", symbol="diamond", line=dict(color="black", width=1)),
+                    name="Your Current Portfolio",
                 ))
-                fig.add_trace(go.Scatter(
-                    x=[opt_vol], y=[opt_return], mode="markers",
-                    marker=dict(size=16, color="red", symbol="star"), name="Max-Sharpe Portfolio",
-                ))
-                if your_return is not None:
-                    fig.add_trace(go.Scatter(
-                        x=[your_vol], y=[your_return], mode="markers",
-                        marker=dict(size=16, color="#e8eaed", symbol="diamond", line=dict(color="black", width=1)),
-                        name="Your Current Portfolio",
-                    ))
-                fig.update_layout(
-                    xaxis_title="Annualized Volatility", yaxis_title="Annualized Return",
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"),
-                    legend=dict(orientation="h"),
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(
+                xaxis_title="Annualized Volatility", yaxis_title="Annualized Return",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"),
+                legend=dict(orientation="h"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-                if your_return is not None:
-                    st.info(f"**Your Current Portfolio** sits at {your_vol*100:.2f}% volatility / {your_return*100:.2f}% return — "
-                            f"the white diamond on the chart above.")
+            if your_return is not None:
+                st.info(f"**Your Current Portfolio** sits at {your_vol*100:.2f}% volatility / {your_return*100:.2f}% return — "
+                        f"the white diamond on the chart above.")
 
-                st.markdown("**Max-Sharpe Portfolio Weights** (ticker-level, unconstrained by your risk profile)")
-                opt_df = pd.DataFrame({"Ticker": tickers_order, "Weight": [f"{w*100:.1f}%" for w in optimal_weights]})
-                st.dataframe(opt_df, use_container_width=True, hide_index=True)
-                st.caption(f"Annualized Return: {opt_return*100:.2f}%  |  Annualized Volatility: {opt_vol*100:.2f}%")
+            st.markdown("**Max-Sharpe Portfolio Weights** (ticker-level, unconstrained by your risk profile)")
+            opt_df = pd.DataFrame({"Ticker": tickers_order, "Weight": [f"{w*100:.1f}%" for w in optimal_weights]})
+            st.dataframe(opt_df, use_container_width=True, hide_index=True)
+            st.caption(f"Annualized Return: {opt_return*100:.2f}%  |  Annualized Volatility: {opt_vol*100:.2f}%")
 
 
 # =======================================================================

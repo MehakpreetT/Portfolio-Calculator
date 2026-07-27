@@ -814,11 +814,13 @@ def render_theme_css(theme_name: str):
             .main, [data-testid="stAppViewContainer"] {{
                 background: linear-gradient(160deg, {p['bg']} 0%, {p['bg_gradient_end']} 100%);
             }}
-            .main *, [data-testid="stAppViewContainer"] p, [data-testid="stAppViewContainer"] span,
-            [data-testid="stAppViewContainer"] label, [data-testid="stMarkdownContainer"] {{
+            .main *:not(h1):not(h2):not(h3), [data-testid="stAppViewContainer"] p, [data-testid="stAppViewContainer"] span,
+            [data-testid="stAppViewContainer"] label, [data-testid="stMarkdownContainer"]:not(:has(h1)):not(:has(h2)):not(:has(h3)) {{
                 color: {p['text']};
             }}
-            h1, h2, h3 {{ color: {p['text']}; letter-spacing: -0.3px; }}
+            h1, h2, h3 {{ letter-spacing: -0.3px; }}
+            h2, h3 {{ color: {p['accent']}; }}
+            [data-testid="stHeaderActionElements"] {{ display: none; }}
 
             h1 {{
                 background: linear-gradient(90deg, {p['accent']} 0%, {p['accent_strong']} 50%, {p['accent']} 100%);
@@ -875,6 +877,20 @@ def render_theme_css(theme_name: str):
                 border-color: {p['border']} !important;
             }}
 
+            /* BaseWeb renders the OPEN dropdown list in a portal outside .stSelectbox,
+               so it needs its own unscoped rule to pick up the current theme. */
+            [data-baseweb="popover"] [data-baseweb="menu"] {{
+                background-color: {p['card']} !important;
+                border: 1px solid {p['border']} !important;
+            }}
+            [data-baseweb="popover"] [data-baseweb="menu"] li {{
+                background-color: {p['card']} !important;
+                color: {p['text']} !important;
+            }}
+            [data-baseweb="popover"] [data-baseweb="menu"] li:hover {{
+                background-color: {p['bg_gradient_end']} !important;
+            }}
+
             .edu-card, .kpi-card {{
                 background: linear-gradient(160deg, {p['card']} 0%, {p['card_gradient_end']} 100%);
                 border: 1px solid {p['border']}; border-radius: 10px;
@@ -922,18 +938,18 @@ authenticator = stauth.Authenticate(
 )
 
 if not st.session_state.get("authentication_status"):
-    _, toggle_col = st.columns([5, 1])
-    with toggle_col:
-        theme_choice = st.selectbox("Theme", ["Dark", "Light"], index=0 if st.session_state.theme == "dark" else 1,
-                                     key="_theme_toggle_login", label_visibility="collapsed")
-        new_theme = theme_choice.lower()
-        if new_theme != st.session_state.theme:
-            st.session_state.theme = new_theme
-            st.rerun()
-
     left_pad, center, right_pad = st.columns([1, 2, 1])
     with center:
         st.markdown('<div class="login-card">', unsafe_allow_html=True)
+
+        theme_row_l, theme_row_r = st.columns([4, 1])
+        with theme_row_r:
+            theme_choice = st.selectbox("Theme", ["Dark", "Light"], index=0 if st.session_state.theme == "dark" else 1,
+                                         key="_theme_toggle_login")
+            new_theme = theme_choice.lower()
+            if new_theme != st.session_state.theme:
+                st.session_state.theme = new_theme
+                st.rerun()
 
         if os.path.exists(LOGO_PATH):
             logo_l, logo_c, logo_r = st.columns([1, 1, 1])
@@ -942,6 +958,11 @@ if not st.session_state.get("authentication_status"):
 
         st.markdown("<h1 style='text-align:center; margin-bottom:0;'>Wealthscope</h1>", unsafe_allow_html=True)
         st.markdown("<p class='login-tagline' style='text-align:center;'>Insight. Growth. Wealth.</p>", unsafe_allow_html=True)
+        st.markdown(
+            "<p style='text-align:center; font-size:15px; margin-top:8px;'>"
+            "Build, backtest, and stress-test investment portfolios with real market data — all in one place."
+            "</p>", unsafe_allow_html=True
+        )
         st.caption("Log in or create an account to build and save portfolios.")
 
         login_tab, register_tab = st.tabs(["Login", "Register"])

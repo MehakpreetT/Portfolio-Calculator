@@ -1,4 +1,4 @@
-# PortPicker
+# Wealthscope
 
 A live portfolio construction web app that builds a target asset allocation from a user's risk profile, investment horizon, and current market conditions — then lets them backtest it, stress-test it, analyze its sensitivity to macro factors, simulate rebalancing, and track it over time. Supports user accounts so each person's portfolios stay private and saved.
 
@@ -10,7 +10,7 @@ Built with Python and Streamlit.
 
 ## What it does
 
-PortPicker starts from a strategic asset-mix baseline (Conservative / Neutral / Growth), then applies two tactical tilts within a ±15% range:
+Wealthscope starts from a strategic asset-mix baseline (Conservative / Neutral / Growth), then applies two tactical tilts within a ±15% range:
 
 - **Investment horizon** — steps every 2 years (0-2yr through 20+yr, in ten 2-year buckets), from most defensive to most aggressive
 - **Market conditions** — a composite score built from the prior trading day's VIX level and S&P 500 momentum at market open

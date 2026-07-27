@@ -235,10 +235,12 @@ def horizon_bucket_label(years: float) -> str:
     return f"{lo}-{lo+2} years"
 
 
-def expected_return(weights: dict) -> float:
+def expected_return(weights: dict, assumptions: dict = None) -> float:
     """Blended illustrative expected return for the given weights — shifts as
-    weights shift with horizon/tilt. Explicitly NOT a forecast or guarantee."""
-    return sum(EXPECTED_RETURNS.get(k, 0.0) * w for k, w in weights.items())
+    weights shift with horizon/tilt, or as the user adjusts assumptions on the
+    Calculator page. Explicitly NOT a forecast or guarantee."""
+    assumptions = assumptions or EXPECTED_RETURNS
+    return sum(assumptions.get(k, 0.0) * w for k, w in weights.items())
 
 
 @st.cache_data(ttl=60 * 60 * 12)
@@ -274,6 +276,15 @@ def historical_market_condition_score(as_of_date_str: str):
         end = (as_of + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
         vix_hist = yf.Ticker("^VIX").history(start=start, end=end)
         spx_hist = yf.Ticker("^GSPC").history(start=start, end=end)
+
+        # yfinance returns a timezone-aware index; as_of is naive. Comparing
+        # the two directly raises, which was silently caught below and made
+        # this function always return None — normalize both to naive first.
+        if getattr(vix_hist.index, "tz", None) is not None:
+            vix_hist.index = vix_hist.index.tz_localize(None)
+        if getattr(spx_hist.index, "tz", None) is not None:
+            spx_hist.index = spx_hist.index.tz_localize(None)
+
         vix_hist = vix_hist[vix_hist.index <= as_of]
         spx_hist = spx_hist[spx_hist.index <= as_of]
         if len(vix_hist) < 2 or len(spx_hist) < 2:
@@ -896,6 +907,9 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+if "custom_expected_returns" not in st.session_state:
+    st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
+
 with st.sidebar:
     st.markdown("### 📊 PortPicker")
     st.write(f"Logged in as **{st.session_state['name']}**")
@@ -1029,14 +1043,17 @@ if page == "Dashboard":
     if not portfolios:
         st.info("You don't have any saved portfolios yet. Head to the Calculator to build one, or try the Risk Questionnaire to get a starting recommendation.")
     else:
-        latest = portfolios[-1]
-        st.markdown(f"**Most Recent Saved Portfolio: {latest['name']}**")
-        st.caption(f"Saved {latest['date_saved']} — {latest['risk_profile']} profile, {latest['horizon']}yr horizon, ${latest['amount']:,.0f}")
+        names = [p["name"] for p in portfolios]
+        default_idx = len(names) - 1  # most recent by default
+        chosen_name = st.selectbox("View saved portfolio", names, index=default_idx)
+        chosen = next(p for p in portfolios if p["name"] == chosen_name)
+
+        st.caption(f"Saved {chosen['date_saved']} — {chosen['risk_profile']} profile, {chosen['horizon']}yr horizon, ${chosen['amount']:,.0f}")
 
         left, right = st.columns([1, 1.3])
-        w = latest["weights"]
+        w = chosen["weights"]
         dash_labels = dict(ASSET_LABELS)
-        for key, v in latest.get("custom_tickers", {}).items():
+        for key, v in chosen.get("custom_tickers", {}).items():
             dash_labels[key] = f"{v['name']} ({v['ticker']})"
         with left:
             fig = go.Figure(data=[go.Pie(labels=[dash_labels.get(k, k) for k in w], values=[v * 100 for v in w.values()],
@@ -1177,9 +1194,10 @@ elif page == "Calculator":
         heading = "Your Custom Allocation" if st.session_state.is_customized else "Recommended Allocation"
         st.subheader(heading)
 
-        exp_ret = expected_return({k: v for k, v in weights.items() if k in EXPECTED_RETURNS})
+        exp_ret = expected_return({k: v for k, v in weights.items() if k in st.session_state.custom_expected_returns},
+                                   st.session_state.custom_expected_returns)
         st.metric("Illustrative Expected Annual Return", f"{exp_ret*100:.2f}%",
-                   help="Based on long-run capital market assumptions per asset class, weighted by your current allocation. Not a forecast or guarantee — shifts as your horizon bucket or weights change.")
+                   help="Based on long-run capital market assumptions per asset class, weighted by your current allocation. Not a forecast or guarantee — shifts as your horizon bucket, weights, or return assumptions change.")
 
         with st.expander("Why this number, and how much should you trust it?"):
             st.markdown(
@@ -1190,22 +1208,36 @@ elif page == "Calculator":
             st.latex(r"\text{Expected Return} = \sum_{i} (\text{Weight}_i \times \text{Assumed Return}_i)")
             exp_rows = [
                 {"Asset Class": combined_labels.get(k, k), "Weight": f"{weights[k]*100:.1f}%",
-                 "Assumed Long-Run Return": f"{EXPECTED_RETURNS[k]*100:.1f}%",
-                 "Contribution": f"{weights[k]*EXPECTED_RETURNS[k]*100:.2f}%"}
-                for k in weights if k in EXPECTED_RETURNS
+                 "Assumed Long-Run Return": f"{st.session_state.custom_expected_returns[k]*100:.1f}%",
+                 "Contribution": f"{weights[k]*st.session_state.custom_expected_returns[k]*100:.2f}%"}
+                for k in weights if k in st.session_state.custom_expected_returns
             ]
             st.dataframe(pd.DataFrame(exp_rows), use_container_width=True, hide_index=True)
             st.markdown(
                 "**Why these specific numbers?** They're rough, commonly-cited long-run historical averages per "
                 "asset class (e.g. broad equities ~7-9%/yr, bonds ~4%/yr over multi-decade periods) — the same "
                 "order of magnitude you'd see in most institutional capital market assumption sheets, simplified "
-                "for this project.\n\n"
+                "for this project. **You can adjust them below** if you have your own view.\n\n"
                 "**Should you trust it as a forecast?** No — treat it as a rough anchor, not a promise. Actual "
                 "annual returns vary enormously year to year (a portfolio 'expected' to return 7% might return "
                 "-15% or +25% in any given year). For a data-backed look at how this exact portfolio actually "
                 "performed historically, use the **Backtest & Risk** page instead, which pulls real price history "
                 "rather than assumptions."
             )
+
+        with st.expander("Adjust Return Assumptions"):
+            st.caption("Override the assumed long-run annual return for each asset class — the expected return above updates immediately.")
+            edit_cols = st.columns(4)
+            for i, k in enumerate(EXPECTED_RETURNS):
+                with edit_cols[i % 4]:
+                    st.session_state.custom_expected_returns[k] = st.number_input(
+                        ASSET_LABELS[k], min_value=-20.0, max_value=30.0,
+                        value=st.session_state.custom_expected_returns[k] * 100, step=0.1,
+                        key=f"exp_ret_{k}", format="%.1f",
+                    ) / 100
+            if st.button("Reset to Default Assumptions"):
+                st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
+                st.rerun()
 
         left, right = st.columns([1, 1.3])
         with left:
@@ -1683,24 +1715,57 @@ elif page == "Quarterly Views":
 # PAGE: COMPARE PROFILES
 # =======================================================================
 elif page == "Compare Profiles":
-    st.subheader("Compare All Risk Profiles")
-    compare_amount = st.number_input("Amount for comparison ($)", min_value=1.0, max_value=10_000_000.0, value=20000.0, step=500.0, key="compare_amount")
-    compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=50, value=10, key="compare_horizon")
+    st.subheader("Compare Profiles")
+    compare_mode = st.radio("What do you want to compare?", ["Standard Risk Profiles", "My Saved Portfolios"], horizontal=True)
 
-    score, as_of, _ = market_condition_score(str(date.today()))
-    cols = st.columns(3)
-    for i, profile in enumerate(RiskProfile):
-        w = build_portfolio(profile, compare_horizon, score)
-        with cols[i]:
-            st.markdown(f"**{profile.value}**")
-            fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in w], values=[v * 100 for v in w.values()],
-                                          hole=0.45, textinfo="percent")])
-            fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),
-                               paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
-            st.plotly_chart(fig, use_container_width=True, key=f"compare_pie_{i}")
-            df = pd.DataFrame({"Asset": [ASSET_LABELS[k] for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
-                                "$": [f"${compare_amount*v:,.0f}" for v in w.values()]})
-            st.dataframe(df, use_container_width=True, hide_index=True)
+    if compare_mode == "Standard Risk Profiles":
+        compare_amount = st.number_input("Amount for comparison ($)", min_value=1.0, max_value=10_000_000.0, value=20000.0, step=500.0, key="compare_amount")
+        compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=50, value=10, key="compare_horizon")
+
+        score, as_of, _ = market_condition_score(str(date.today()))
+        cols = st.columns(3)
+        for i, profile in enumerate(RiskProfile):
+            w = build_portfolio(profile, compare_horizon, score)
+            with cols[i]:
+                st.markdown(f"**{profile.value}**")
+                fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in w], values=[v * 100 for v in w.values()],
+                                              hole=0.45, textinfo="percent")])
+                fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),
+                                   paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                st.plotly_chart(fig, use_container_width=True, key=f"compare_pie_{i}")
+                df = pd.DataFrame({"Asset": [ASSET_LABELS[k] for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
+                                    "$": [f"${compare_amount*v:,.0f}" for v in w.values()]})
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+    else:
+        portfolios = load_saved_portfolios(username)
+        if not portfolios:
+            st.info("No saved portfolios yet — save one from the Calculator page first.")
+        else:
+            names = [p["name"] for p in portfolios]
+            selected_names = st.multiselect("Choose up to 3 saved portfolios", names, max_selections=3)
+
+            if not selected_names:
+                st.caption("Pick at least one saved portfolio above to compare.")
+            else:
+                selected_portfolios = [p for p in portfolios if p["name"] in selected_names]
+                cols = st.columns(len(selected_portfolios))
+                for i, p in enumerate(selected_portfolios):
+                    w = p["weights"]
+                    p_labels = dict(ASSET_LABELS)
+                    for key, v in p.get("custom_tickers", {}).items():
+                        p_labels[key] = f"{v['name']} ({v['ticker']})"
+                    with cols[i]:
+                        st.markdown(f"**{p['name']}**")
+                        st.caption(f"{p['risk_profile']}, {p['horizon']}yr, ${p['amount']:,.0f}")
+                        fig = go.Figure(data=[go.Pie(labels=[p_labels.get(k, k) for k in w], values=[v * 100 for v in w.values()],
+                                                      hole=0.45, textinfo="percent")])
+                        fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),
+                                           paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                        st.plotly_chart(fig, use_container_width=True, key=f"saved_compare_pie_{i}")
+                        df = pd.DataFrame({"Asset": [p_labels.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
+                                            "$": [f"${p['amount']*v:,.0f}" for v in w.values()]})
+                        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # =======================================================================

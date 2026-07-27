@@ -916,10 +916,10 @@ def render_theme_css(theme_name: str):
             .kpi-box .value {{ color: {p['text']}; font-size: 24px; font-weight: 700; margin-top: 4px; }}
             .kpi-box .asof {{ color: {p['text_faint']}; font-size: 11px; margin-top: 2px; }}
 
-            .login-card {{
+            div[data-testid="stVerticalBlockBorderWrapper"]:has(.login-tagline) {{
                 background: linear-gradient(160deg, {p['card']} 0%, {p['card_gradient_end']} 100%);
-                border: 1px solid {p['border']}; border-radius: 16px;
-                padding: 40px 44px; margin-top: 20px;
+                border: 1px solid {p['border']} !important; border-radius: 16px !important;
+                padding: 24px 20px; margin-top: 20px;
                 box-shadow: 0 8px 32px {p['shadow']};
             }}
             .login-tagline {{ color: {p['text_muted']}; font-size: 14px; letter-spacing: 1px; text-transform: uppercase; }}
@@ -940,43 +940,40 @@ authenticator = stauth.Authenticate(
 if not st.session_state.get("authentication_status"):
     left_pad, center, right_pad = st.columns([1, 2, 1])
     with center:
-        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+        with st.container(border=True):
+            if os.path.exists(LOGO_PATH):
+                import base64
+                with open(LOGO_PATH, "rb") as f:
+                    logo_b64 = base64.b64encode(f.read()).decode()
+                st.markdown(
+                    f'<div style="display:flex; justify-content:center; align-items:center; width:100%;">'
+                    f'<img src="data:image/png;base64,{logo_b64}" width="140">'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-        if os.path.exists(LOGO_PATH):
-            import base64
-            with open(LOGO_PATH, "rb") as f:
-                logo_b64 = base64.b64encode(f.read()).decode()
+            st.markdown("<h1 style='text-align:center; margin-bottom:0;'>Wealthscope</h1>", unsafe_allow_html=True)
+            st.markdown("<p class='login-tagline' style='text-align:center;'>Insight. Growth. Wealth.</p>", unsafe_allow_html=True)
             st.markdown(
-                f'<div style="display:flex; justify-content:center; align-items:center; width:100%;">'
-                f'<img src="data:image/png;base64,{logo_b64}" width="140">'
-                f'</div>',
-                unsafe_allow_html=True,
+                "<p style='text-align:center; font-size:15px; margin-top:8px;'>"
+                "Build, backtest, and stress-test investment portfolios with real market data — all in one place."
+                "</p>", unsafe_allow_html=True
             )
+            st.caption("Log in or create an account to build and save portfolios.")
 
-        st.markdown("<h1 style='text-align:center; margin-bottom:0;'>Wealthscope</h1>", unsafe_allow_html=True)
-        st.markdown("<p class='login-tagline' style='text-align:center;'>Insight. Growth. Wealth.</p>", unsafe_allow_html=True)
-        st.markdown(
-            "<p style='text-align:center; font-size:15px; margin-top:8px;'>"
-            "Build, backtest, and stress-test investment portfolios with real market data — all in one place."
-            "</p>", unsafe_allow_html=True
-        )
-        st.caption("Log in or create an account to build and save portfolios.")
-
-        login_tab, register_tab = st.tabs(["Login", "Register"])
-        with login_tab:
-            authenticator.login()
-            if st.session_state.get("authentication_status") is False:
-                st.error("Username or password is incorrect.")
-        with register_tab:
-            try:
-                email, username, name = authenticator.register_user(pre_authorized=None)
-                if email:
-                    save_user_config(config)
-                    st.success("Account created — please log in from the Login tab.")
-            except Exception as e:
-                st.error(str(e))
-
-        st.markdown('</div>', unsafe_allow_html=True)
+            login_tab, register_tab = st.tabs(["Login", "Register"])
+            with login_tab:
+                authenticator.login()
+                if st.session_state.get("authentication_status") is False:
+                    st.error("Username or password is incorrect.")
+            with register_tab:
+                try:
+                    email, username, name = authenticator.register_user(pre_authorized=None)
+                    if email:
+                        save_user_config(config)
+                        st.success("Account created — please log in from the Login tab.")
+                except Exception as e:
+                    st.error(str(e))
     st.stop()
 
 # =======================================================================

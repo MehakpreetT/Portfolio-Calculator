@@ -3,6 +3,9 @@ PortPicker — Forward-Looking Portfolio Construction Web App
 --------------------------------------------------------------
 Run locally with:  streamlit run streamlit_app.py
 
+Login: first run auto-creates a default account file (users.yaml) with
+a seeded test account (username: testuser, password: test1234).
+
 Pages (left sidebar once logged in):
   Dashboard, Risk Questionnaire, Calculator, Backtest & Risk,
   Stress Testing, Efficient Frontier, Sensitivity Index,
@@ -571,10 +574,16 @@ def compute_sensitivity(tickers_tuple, period="3y"):
 def simulate_rebalancing(weights: dict, tickers_map: dict, amount: float, date_saved: str):
     tickers_used = {k: tickers_map[k] for k in weights if tickers_map.get(k) is not None}
     try:
-        prices = fetch_price_history(tuple(tickers_used.values()), start=date_saved, end=str(date.today()))
+        # yfinance's `end` is exclusive, so a portfolio saved today/yesterday can
+        # return zero rows unless we push the end date forward by a day.
+        end_date = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+        prices = fetch_price_history(tuple(tickers_used.values()), start=date_saved, end=end_date)
         prices = prices.dropna()
-        if prices.empty:
-            return {"error": "No price data available since the save date."}
+        if len(prices) < 2:
+            days_elapsed = (date.today() - pd.Timestamp(date_saved).date()).days
+            return {"error": f"Only {days_elapsed} day(s) have passed since this portfolio was saved — "
+                              f"not enough time for a full trading day to have closed yet. Try again tomorrow, "
+                              f"or pick a portfolio saved further in the past."}
 
         start_prices = prices.iloc[0]
         current_prices = prices.iloc[-1]
@@ -609,15 +618,44 @@ def simulate_rebalancing(weights: dict, tickers_map: dict, amount: float, date_s
 # 9. CENTRAL BANK POLICY RATES (Fed, BoC, BoE via FRED)
 # =======================================================================
 @st.cache_data(ttl=60 * 60 * 12)
+def fetch_boc_rate():
+    """
+    Bank of Canada's own FRED mirror series (IRSTCB01CAM156N) was discontinued
+    after Dec 2023, so this pulls directly from the Bank of Canada's live
+    Valet API instead — series CBC20210 is the target for the overnight rate,
+    updated the day after each of the Bank's 8 scheduled announcements per year.
+    """
+    import requests
+    try:
+        resp = requests.get(
+            "https://www.bankofcanada.ca/valet/observations/CBC20210/json",
+            params={"recent": 1}, timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        obs = data["observations"][-1]
+        rate = float(obs["CBC20210"]["v"])
+        as_of = obs["d"]
+        return rate, as_of
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 12)
 def fetch_central_bank_rates():
-    """Pulls the latest policy rate for all G10 central banks from FRED.
-    Returns a dict of {bank: (rate, as_of_date)} — any bank that fails to
-    fetch (e.g. a series code that's stale or renamed) is simply omitted
-    rather than breaking the page."""
+    """Pulls the latest policy rate for all G10 central banks. Bank of Canada
+    comes from its own live Valet API (see fetch_boc_rate); the rest come from
+    FRED. Returns a dict of {bank: (rate, as_of_date)} — any bank that fails
+    to fetch is simply omitted rather than breaking the page."""
     import pandas_datareader.data as web
+    results = {}
+
+    boc = fetch_boc_rate()
+    if boc is not None:
+        results["Bank of Canada (Overnight Rate Target)"] = boc
+
     series = {
         "Federal Reserve (Fed Funds Rate)": "DFF",
-        "Bank of Canada (Overnight Rate)": "IRSTCB01CAM156N",
         "Bank of England (Bank Rate)": "IRSTCB01GBM156N",
         "European Central Bank (Deposit Rate)": "ECBDFR",
         "Bank of Japan (Policy Rate)": "IRSTCB01JPM156N",
@@ -628,8 +666,7 @@ def fetch_central_bank_rates():
         "Riksbank (Policy Rate)": "IRSTCB01SEM156N",
     }
     end = date.today()
-    start = end - timedelta(days=400)
-    results = {}
+    start = end - timedelta(days=800)  # wider window — several of these update monthly/quarterly with a lag
     for name, code in series.items():
         try:
             data = web.DataReader(code, "fred", start, end).dropna()
@@ -732,37 +769,95 @@ def build_pdf(weights, amount, risk_profile, horizon, labels_map, tickers_map):
 # =======================================================================
 st.set_page_config(page_title="PortPicker", page_icon="📊", layout="wide")
 
+# Custom logo — drop your image at assets/logo.png (repo root) and it'll show
+# in the sidebar and browser tab automatically. Falls back silently if missing.
+LOGO_PATH = "assets/logo.png"
+if os.path.exists(LOGO_PATH):
+    try:
+        st.logo(LOGO_PATH, size="large")
+    except Exception:
+        pass
+
 st.markdown("""
     <style>
         .main { background-color: #0e1117; }
         h1, h2, h3 { color: #e8eaed; letter-spacing: -0.3px; }
+
+        /* Gradient app title */
+        h1 {
+            background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 50%, #60a5fa 100%);
+            background-size: 200% auto;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: shine 6s linear infinite;
+        }
+        @keyframes shine { to { background-position: 200% center; } }
+
         [data-testid="stMetricValue"] { color: #e8eaed; }
         [data-testid="stMetric"] {
             background-color: #171b24; border: 1px solid #2b2f38;
             border-radius: 10px; padding: 12px 16px;
+            transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
         }
+        [data-testid="stMetric"]:hover {
+            transform: translateY(-2px);
+            border-color: #3b82f6;
+            box-shadow: 0 4px 16px rgba(59, 130, 246, 0.15);
+        }
+
         .stButton>button {
-            background-color: #2563eb; color: white; border: none; border-radius: 8px;
-            font-weight: 600; padding: 0.5em 1.5em; transition: background-color 0.15s ease;
+            background: linear-gradient(135deg, #2563eb, #3b82f6);
+            color: white; border: none; border-radius: 8px;
+            font-weight: 600; padding: 0.5em 1.5em;
+            transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.2s ease;
         }
-        .stButton>button:hover { background-color: #1d4ed8; color: white; }
+        .stButton>button:hover {
+            background: linear-gradient(135deg, #1d4ed8, #2563eb);
+            color: white; transform: translateY(-1px);
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
+        }
+        .stButton>button:active { transform: translateY(0px); }
+
         .stDownloadButton>button {
             background-color: #1f2937; color: white; border: 1px solid #374151; border-radius: 8px;
+            transition: border-color 0.15s ease;
         }
-        section[data-testid="stSidebar"] { background-color: #10131a; border-right: 1px solid #232733; }
+        .stDownloadButton>button:hover { border-color: #60a5fa; }
+
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #10131a 0%, #0c0e13 100%);
+            border-right: 1px solid #232733;
+        }
+
         .edu-card, .kpi-card {
             background-color: #171b24; border: 1px solid #2b2f38; border-radius: 10px;
             padding: 16px 20px; margin-bottom: 14px;
+            transition: transform 0.15s ease, border-color 0.15s ease;
         }
+        .edu-card:hover { transform: translateY(-2px); border-color: #3b3f4d; }
         .edu-card h4 { margin: 0 0 8px 0; color: #60a5fa; }
+
         .kpi-row { display: flex; gap: 14px; flex-wrap: wrap; }
         .kpi-box {
-            background-color: #171b24; border: 1px solid #2b2f38; border-radius: 10px;
+            background: linear-gradient(160deg, #171b24 0%, #14171f 100%);
+            border: 1px solid #2b2f38; border-radius: 10px;
             padding: 14px 18px; flex: 1; min-width: 180px;
+            transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .kpi-box:hover {
+            transform: translateY(-2px);
+            border-color: #3b82f6;
+            box-shadow: 0 4px 16px rgba(59, 130, 246, 0.12);
         }
         .kpi-box .label { color: #9aa0ab; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
         .kpi-box .value { color: #e8eaed; font-size: 24px; font-weight: 700; margin-top: 4px; }
         .kpi-box .asof { color: #6b7280; font-size: 11px; margin-top: 2px; }
+
+        /* Smooth fade-in for the whole page body on load/rerun */
+        [data-testid="stAppViewContainer"] > .main {
+            animation: fadeIn 0.35s ease-in;
+        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     </style>
 """, unsafe_allow_html=True)
 
@@ -1085,6 +1180,32 @@ elif page == "Calculator":
         exp_ret = expected_return({k: v for k, v in weights.items() if k in EXPECTED_RETURNS})
         st.metric("Illustrative Expected Annual Return", f"{exp_ret*100:.2f}%",
                    help="Based on long-run capital market assumptions per asset class, weighted by your current allocation. Not a forecast or guarantee — shifts as your horizon bucket or weights change.")
+
+        with st.expander("Why this number, and how much should you trust it?"):
+            st.markdown(
+                "This is a **weighted average** of long-run historical return assumptions for each asset class — "
+                "not a model prediction, and not specific to your holdings' actual future performance. "
+                "The formula is simply:"
+            )
+            st.latex(r"\text{Expected Return} = \sum_{i} (\text{Weight}_i \times \text{Assumed Return}_i)")
+            exp_rows = [
+                {"Asset Class": combined_labels.get(k, k), "Weight": f"{weights[k]*100:.1f}%",
+                 "Assumed Long-Run Return": f"{EXPECTED_RETURNS[k]*100:.1f}%",
+                 "Contribution": f"{weights[k]*EXPECTED_RETURNS[k]*100:.2f}%"}
+                for k in weights if k in EXPECTED_RETURNS
+            ]
+            st.dataframe(pd.DataFrame(exp_rows), use_container_width=True, hide_index=True)
+            st.markdown(
+                "**Why these specific numbers?** They're rough, commonly-cited long-run historical averages per "
+                "asset class (e.g. broad equities ~7-9%/yr, bonds ~4%/yr over multi-decade periods) — the same "
+                "order of magnitude you'd see in most institutional capital market assumption sheets, simplified "
+                "for this project.\n\n"
+                "**Should you trust it as a forecast?** No — treat it as a rough anchor, not a promise. Actual "
+                "annual returns vary enormously year to year (a portfolio 'expected' to return 7% might return "
+                "-15% or +25% in any given year). For a data-backed look at how this exact portfolio actually "
+                "performed historically, use the **Backtest & Risk** page instead, which pulls real price history "
+                "rather than assumptions."
+            )
 
         left, right = st.columns([1, 1.3])
         with left:
@@ -1436,6 +1557,21 @@ elif page == "Rebalancing Simulator":
     st.subheader("Rebalancing Simulator")
     st.caption("Pick a saved portfolio to see how its weights would have drifted since you saved it, and what trades would bring it back to target.")
 
+    with st.expander("How this works"):
+        st.markdown("""
+        When you save a portfolio, PortPicker records its target weights, the dollar amount, and the save date.
+        This tool then:
+        1. Pulls actual historical prices for each holding from the save date to today
+        2. Calculates how many "shares" your dollar amount would have bought at the save-date price
+        3. Revalues those shares at today's price to see your current dollar value per holding
+        4. Compares the resulting current weights to your original targets — the difference is drift
+        5. Calculates the dollar trade needed per holding to bring weights back to target
+
+        **Why it might say no data is available:** yfinance (the price data source) needs at least one full
+        trading day to have closed between your save date and today. If you just saved a portfolio, come back
+        tomorrow.
+        """)
+
     portfolios = load_saved_portfolios(username)
     if not portfolios:
         st.info("No saved portfolios yet — save one from the Calculator page first.")
@@ -1494,7 +1630,7 @@ elif page == "Rebalancing Simulator":
 # =======================================================================
 elif page == "Quarterly Views":
     st.subheader("Quarterly Portfolio Views")
-    st.caption("Shows how your selected portfolio's allocation would have looked at the start of each of the last 4 quarters, based on historical market conditions at that time.")
+    st.caption("Shows how your selected portfolio's allocation would have looked at the start of each quarter of a chosen year, based on historical market conditions at that time.")
 
     selection = select_portfolio_for_page("quarterly")
     if selection:
@@ -1503,12 +1639,13 @@ elif page == "Quarterly Views":
         labels_map = selection["labels_map"]
 
         today = date.today()
-        quarter_starts = []
-        for i in range(4):
-            q_date = today - timedelta(days=91 * i)
-            q_month = ((q_date.month - 1) // 3) * 3 + 1
-            quarter_starts.append(date(q_date.year, q_month, 1))
-        quarter_starts = sorted(set(quarter_starts))
+        year_options = [today.year, today.year - 1, today.year - 2]
+        selected_year = st.selectbox("Year", year_options, index=0)
+
+        quarter_starts = [date(selected_year, m, 1) for m in (1, 4, 7, 10) if date(selected_year, m, 1) <= today]
+
+        if selected_year == today.year and len(quarter_starts) < 4:
+            st.caption(f"{selected_year} is the current year, so only the {len(quarter_starts)} quarter(s) that have already started are shown — future quarters don't have market data yet.")
 
         if st.button("Generate Quarterly Views"):
             with st.spinner("Pulling historical market conditions for each quarter..."):
@@ -1524,7 +1661,8 @@ elif page == "Quarterly Views":
             cols = st.columns(len(quarterly_data))
             for col, (q_date, hist_score, w) in zip(cols, quarterly_data):
                 with col:
-                    st.markdown(f"**{q_date.strftime('%b %Y')}**")
+                    quarter_num = (q_date.month - 1) // 3 + 1
+                    st.markdown(f"**Q{quarter_num} {q_date.year}**")
                     st.caption(f"Market score: {hist_score:+.2f}" if hist_score is not None else "Market score: N/A")
                     fig = go.Figure(data=[go.Pie(labels=[labels_map.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                                   hole=0.45, textinfo="percent")])
@@ -1535,7 +1673,7 @@ elif page == "Quarterly Views":
             st.divider()
             st.markdown("**Weight Evolution by Asset Class**")
             evo_df = pd.DataFrame({
-                q_date.strftime("%b %Y"): {labels_map.get(k, k): round(v * 100, 1) for k, v in w.items()}
+                f"Q{(q_date.month - 1) // 3 + 1} {q_date.year}": {labels_map.get(k, k): round(v * 100, 1) for k, v in w.items()}
                 for q_date, _, w in quarterly_data
             }).T
             st.dataframe(evo_df, use_container_width=True)

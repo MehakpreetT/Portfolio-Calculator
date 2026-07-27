@@ -942,19 +942,16 @@ if not st.session_state.get("authentication_status"):
     with center:
         st.markdown('<div class="login-card">', unsafe_allow_html=True)
 
-        theme_row_l, theme_row_r = st.columns([4, 1])
-        with theme_row_r:
-            theme_choice = st.selectbox("Theme", ["Dark", "Light"], index=0 if st.session_state.theme == "dark" else 1,
-                                         key="_theme_toggle_login")
-            new_theme = theme_choice.lower()
-            if new_theme != st.session_state.theme:
-                st.session_state.theme = new_theme
-                st.rerun()
-
         if os.path.exists(LOGO_PATH):
-            logo_l, logo_c, logo_r = st.columns([1, 1, 1])
-            with logo_c:
-                st.image(LOGO_PATH, width=140)
+            import base64
+            with open(LOGO_PATH, "rb") as f:
+                logo_b64 = base64.b64encode(f.read()).decode()
+            st.markdown(
+                f'<div style="display:flex; justify-content:center; align-items:center; width:100%;">'
+                f'<img src="data:image/png;base64,{logo_b64}" width="140">'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         st.markdown("<h1 style='text-align:center; margin-bottom:0;'>Wealthscope</h1>", unsafe_allow_html=True)
         st.markdown("<p class='login-tagline' style='text-align:center;'>Insight. Growth. Wealth.</p>", unsafe_allow_html=True)
@@ -1003,13 +1000,6 @@ with st.sidebar:
     else:
         st.markdown("### Wealthscope")
     st.write(f"Logged in as **{st.session_state['name']}**")
-
-    theme_choice = st.selectbox("Theme", ["Dark", "Light"], index=0 if st.session_state.theme == "dark" else 1,
-                                 key="_theme_toggle_sidebar")
-    new_theme = theme_choice.lower()
-    if new_theme != st.session_state.theme:
-        st.session_state.theme = new_theme
-        st.rerun()
 
     authenticator.logout()
     st.divider()
@@ -1855,19 +1845,53 @@ elif page == "Compare Profiles":
             names = [p["name"] for p in portfolios]
             selected_names = st.multiselect("Choose up to 3 saved portfolios", names, max_selections=3)
 
+            # Must run before any compare_slider_* widgets below are instantiated this
+            # run — same Streamlit restriction as the expected-returns reset.
+            for p in portfolios:
+                flag_key = f"_reset_compare_{p['name']}"
+                if st.session_state.get(flag_key):
+                    for k in p["weights"]:
+                        st.session_state[f"compare_slider_{p['name']}_{k}"] = int(round(p["weights"][k] * 100))
+                    st.session_state[flag_key] = False
+
             if not selected_names:
                 st.caption("Pick at least one saved portfolio above to compare.")
             else:
                 selected_portfolios = [p for p in portfolios if p["name"] in selected_names]
+                st.caption("Adjust the sliders under any portfolio to see how a change would affect it — this is a live \"what-if\" view only and never changes your actual saved portfolio.")
                 cols = st.columns(len(selected_portfolios))
                 for i, p in enumerate(selected_portfolios):
-                    w = p["weights"]
+                    original_w = p["weights"]
                     p_labels = dict(ASSET_LABELS)
                     for key, v in p.get("custom_tickers", {}).items():
                         p_labels[key] = f"{v['name']} ({v['ticker']})"
+
                     with cols[i]:
                         st.markdown(f"**{p['name']}**")
                         st.caption(f"{p['risk_profile']}, {p['horizon']}yr, ${p['amount']:,.0f}")
+
+                        with st.expander("Adjust weights"):
+                            edited = {}
+                            for k in original_w:
+                                edited[k] = st.slider(
+                                    p_labels.get(k, k), 0, 100, int(round(original_w[k] * 100)),
+                                    key=f"compare_slider_{p['name']}_{k}",
+                                )
+                            raw_total = sum(edited.values())
+                            w = {k: v / raw_total for k, v in edited.items()} if raw_total > 0 else original_w
+                            changed = any(abs(w[k] - original_w[k]) > 0.001 for k in original_w)
+                            if changed:
+                                st.caption("Showing your edited weights (normalized to 100%).")
+                                if st.button("Reset to saved weights", key=f"compare_reset_{p['name']}"):
+                                    st.session_state[f"_reset_compare_{p['name']}"] = True
+                                    st.rerun()
+                            else:
+                                w = original_w
+
+                        exp_ret = expected_return({k: v for k, v in w.items() if k in st.session_state.custom_expected_returns},
+                                                   st.session_state.custom_expected_returns)
+                        st.metric("Illustrative Expected Return", f"{exp_ret*100:.2f}%")
+
                         fig = go.Figure(data=[go.Pie(labels=[p_labels.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                                       hole=0.45, textinfo="percent")])
                         fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),

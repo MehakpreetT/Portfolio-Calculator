@@ -1109,6 +1109,16 @@ elif page == "Risk Questionnaire":
 # PAGE: CALCULATOR
 # =======================================================================
 elif page == "Calculator":
+    # Must run before the exp_ret_* number_input widgets below are instantiated —
+    # Streamlit forbids overwriting a widget's session_state value in the same
+    # run after that widget has already been created, so the reset has to happen
+    # here, one run ahead of the button click that requests it.
+    if st.session_state.get("_reset_assumptions"):
+        st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
+        for k in EXPECTED_RETURNS:
+            st.session_state[f"exp_ret_{k}"] = EXPECTED_RETURNS[k] * 100
+        st.session_state["_reset_assumptions"] = False
+
     col1, col2, col3 = st.columns(3)
     with col1:
         amount = st.number_input("Investment Amount ($)", min_value=1.0, max_value=10_000_000.0, value=min(st.session_state.current_amount, 10_000_000.0), step=500.0)
@@ -1236,9 +1246,7 @@ elif page == "Calculator":
                         key=f"exp_ret_{k}", format="%.1f",
                     ) / 100
             if st.button("Reset to Default Assumptions"):
-                st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
-                for k in EXPECTED_RETURNS:
-                    st.session_state[f"exp_ret_{k}"] = EXPECTED_RETURNS[k] * 100
+                st.session_state["_reset_assumptions"] = True
                 st.rerun()
 
         left, right = st.columns([1, 1.3])

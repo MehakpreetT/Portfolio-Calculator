@@ -76,18 +76,27 @@ STRATEGY_NOTES = {
         "philosophy": "The majority of the portfolio sits in fixed income to dampen volatility, with small equity, gold, and REIT sleeves for diversification and inflation protection. Emerging markets are excluded to avoid the sharpest drawdowns.",
         "expected_volatility": "Low",
         "who_its_for": "Investors nearing a financial goal, or anyone who would be tempted to sell during a downturn.",
+        "typical_drawdown": "Historically, portfolios with this mix have seen peak-to-trough declines in the 10-15% range during major downturns, versus 30%+ for all-equity portfolios.",
+        "time_horizon_fit": "Best suited to a horizon under 5 years, or for money you can't afford to see drop sharply in the short term.",
+        "rebalancing_note": "Because the mix is bond-heavy, drift tends to be slower — checking in quarterly is usually enough.",
     },
     RiskProfile.NEUTRAL: {
         "summary": "Balances growth and stability.",
         "philosophy": "Roughly 60/40 growth-to-defensive split, diversified across regions plus gold and REIT sleeves to smooth out equity/bond correlation risk.",
         "expected_volatility": "Moderate",
         "who_its_for": "Investors with a multi-year horizon who want growth but aren't chasing maximum returns.",
+        "typical_drawdown": "Historically, this mix has seen peak-to-trough declines in the 15-25% range during major downturns.",
+        "time_horizon_fit": "Fits well for a 5-15 year horizon — long enough to ride out a downturn, short enough that capital preservation still matters.",
+        "rebalancing_note": "A meaningful equity sleeve means this mix drifts faster than a conservative one — a semi-annual check is reasonable.",
     },
     RiskProfile.GROWTH: {
         "summary": "Prioritizes long-term capital growth over stability.",
         "philosophy": "Heavily weighted toward equities and real assets (REITs, gold) for higher long-run growth potential. Fixed income is minimal, used mainly to reduce extreme swings.",
         "expected_volatility": "High",
         "who_its_for": "Younger investors or anyone with a long time horizon and high tolerance for drawdowns.",
+        "typical_drawdown": "Historically, all-equity-leaning portfolios like this have seen peak-to-trough declines of 30%+ in severe downturns (e.g. 2008, early 2020).",
+        "time_horizon_fit": "Best suited to a 15+ year horizon, where there's time to recover from a deep drawdown without needing to sell at a loss.",
+        "rebalancing_note": "Higher equity weight means faster drift — worth checking quarterly, especially after a strong equity rally.",
     },
 }
 
@@ -180,14 +189,21 @@ def load_saved_portfolios(username):
     return []
 
 
-def save_portfolio(username, name, amount, risk_profile, horizon, weights, stop_loss=None):
+MAX_SAVED_PORTFOLIOS = 10
+
+
+def save_portfolio(username, name, amount, risk_profile, horizon, weights, stop_loss=None, custom_tickers=None):
     portfolios = load_saved_portfolios(username)
+    if len(portfolios) >= MAX_SAVED_PORTFOLIOS:
+        return False
     portfolios.append({
         "name": name, "date_saved": str(date.today()), "amount": amount,
         "risk_profile": risk_profile, "horizon": horizon, "weights": weights, "stop_loss": stop_loss,
+        "custom_tickers": custom_tickers or {},
     })
     with open(user_portfolio_file(username), "w") as f:
         json.dump(portfolios, f, indent=2)
+    return True
 
 
 def delete_portfolio(username, index):
@@ -275,21 +291,27 @@ def historical_market_condition_score(as_of_date_str: str):
         return None
 
 
-def build_portfolio(risk_profile, horizon_years, market_score):
-    base = STRATEGIC_MIX[risk_profile].copy()
+def apply_tactical_tilt(base: dict, horizon_years, market_score):
+    """
+    Applies the same horizon + market-condition tilt logic to ANY base weights
+    dict — the 8 core asset classes are tilted between equity-like/defensive;
+    any other keys (e.g. custom tickers) are treated as fixed/untouched and
+    the whole thing is renormalized to sum to 1 at the end.
+    """
+    base = dict(base)
     h_tilt = horizon_tilt(horizon_years)
     m_score = market_score if market_score is not None else 0.0
 
     composite_tilt = 0.65 * h_tilt + 0.35 * m_score
     composite_tilt = max(-1.0, min(1.0, composite_tilt))
 
-    equity_like_keys = ["cdn_eq", "us_eq", "intl_eq", "em_eq", "reit"]
-    defensive_keys = ["bonds", "cash", "gold"]
+    equity_like_keys = [k for k in ["cdn_eq", "us_eq", "intl_eq", "em_eq", "reit"] if k in base]
+    defensive_keys = [k for k in ["bonds", "cash", "gold"] if k in base]
 
     shift = composite_tilt * TACTICAL_RANGE
     total_equity_base = sum(base[k] for k in equity_like_keys)
     total_defensive_base = sum(base[k] for k in defensive_keys)
-    shift = max(min(shift, total_defensive_base * 0.9), -total_equity_base * 0.9)
+    shift = max(min(shift, total_defensive_base * 0.9), -total_equity_base * 0.9) if (total_equity_base > 0 and total_defensive_base > 0) else 0.0
 
     adjusted = base.copy()
     if total_equity_base > 0:
@@ -300,7 +322,11 @@ def build_portfolio(risk_profile, horizon_years, market_score):
             adjusted[k] = base[k] - shift * (base[k] / total_defensive_base)
 
     total = sum(adjusted.values())
-    return {k: v / total for k, v in adjusted.items()}
+    return {k: v / total for k, v in adjusted.items()} if total > 0 else adjusted
+
+
+def build_portfolio(risk_profile, horizon_years, market_score):
+    return apply_tactical_tilt(STRATEGIC_MIX[risk_profile], horizon_years, market_score)
 
 
 # =======================================================================
@@ -481,32 +507,61 @@ def run_stress_test(weights: dict, tickers_map: dict, amount: float, start: str,
 @st.cache_data(ttl=60 * 60 * 12)
 def compute_sensitivity(tickers_tuple, period="3y"):
     tickers = [t for t in tickers_tuple if t is not None]
-    prices = fetch_price_history(tuple(tickers), period=period).dropna()
-    returns = prices.pct_change().dropna()
+    if not tickers:
+        return {}
 
-    tnx = yf.Ticker("^TNX").history(period=period)["Close"]  # 10yr yield, in %
-    tnx_changes = tnx.diff().dropna()
+    def _clean(series):
+        # Normalize timezone so US-listed and Canadian-listed tickers align on date,
+        # and drop only that series' own missing values (not shared with others).
+        s = series.copy()
+        if getattr(s.index, "tz", None) is not None:
+            s.index = s.index.tz_localize(None)
+        s.index = s.index.normalize()
+        return s.dropna()
 
-    spx = yf.Ticker("^GSPC").history(period=period)["Close"]
-    spx_returns = spx.pct_change().dropna()
+    try:
+        prices = fetch_price_history(tuple(tickers), period=period)
+    except Exception:
+        return {}
 
-    oil = yf.Ticker("CL=F").history(period=period)["Close"]
-    oil_returns = oil.pct_change().dropna()
+    tnx_changes = spx_returns = oil_returns = None
+    try:
+        tnx = yf.Ticker("^TNX").history(period=period)["Close"]
+        tnx_changes = _clean(tnx.diff())
+    except Exception:
+        pass
+    try:
+        spx = yf.Ticker("^GSPC").history(period=period)["Close"]
+        spx_returns = _clean(spx.pct_change())
+    except Exception:
+        pass
+    try:
+        oil = yf.Ticker("CL=F").history(period=period)["Close"]
+        oil_returns = _clean(oil.pct_change())
+    except Exception:
+        pass
 
     results = {}
     for t in tickers:
-        if t not in returns.columns:
+        if t not in prices.columns:
+            results[t] = {"rate_beta": None, "market_beta": None, "oil_beta": None}
             continue
-        asset_ret = returns[t]
 
-        aligned_rate = pd.concat([asset_ret, tnx_changes], axis=1, join="inner").dropna()
-        rate_beta = np.polyfit(aligned_rate.iloc[:, 1], aligned_rate.iloc[:, 0], 1)[0] if len(aligned_rate) > 20 else None
+        asset_ret = _clean(prices[t].pct_change())
 
-        aligned_mkt = pd.concat([asset_ret, spx_returns], axis=1, join="inner").dropna()
-        market_beta = np.polyfit(aligned_mkt.iloc[:, 1], aligned_mkt.iloc[:, 0], 1)[0] if len(aligned_mkt) > 20 else None
-
-        aligned_oil = pd.concat([asset_ret, oil_returns], axis=1, join="inner").dropna()
-        oil_beta = np.polyfit(aligned_oil.iloc[:, 1], aligned_oil.iloc[:, 0], 1)[0] if len(aligned_oil) > 20 else None
+        rate_beta = market_beta = oil_beta = None
+        if tnx_changes is not None:
+            aligned = pd.concat([asset_ret, tnx_changes], axis=1, join="inner").dropna()
+            if len(aligned) > 20:
+                rate_beta = np.polyfit(aligned.iloc[:, 1], aligned.iloc[:, 0], 1)[0]
+        if spx_returns is not None:
+            aligned = pd.concat([asset_ret, spx_returns], axis=1, join="inner").dropna()
+            if len(aligned) > 20:
+                market_beta = np.polyfit(aligned.iloc[:, 1], aligned.iloc[:, 0], 1)[0]
+        if oil_returns is not None:
+            aligned = pd.concat([asset_ret, oil_returns], axis=1, join="inner").dropna()
+            if len(aligned) > 20:
+                oil_beta = np.polyfit(aligned.iloc[:, 1], aligned.iloc[:, 0], 1)[0]
 
         results[t] = {"rate_beta": rate_beta, "market_beta": market_beta, "oil_beta": oil_beta}
 
@@ -558,14 +613,22 @@ def simulate_rebalancing(weights: dict, tickers_map: dict, amount: float, date_s
 # =======================================================================
 @st.cache_data(ttl=60 * 60 * 12)
 def fetch_central_bank_rates():
-    """Pulls the latest policy rate for the Fed, Bank of Canada, and Bank of
-    England from FRED. Returns a dict of {bank: (rate, as_of_date)} — any bank
-    that fails to fetch is simply omitted rather than breaking the page."""
+    """Pulls the latest policy rate for all G10 central banks from FRED.
+    Returns a dict of {bank: (rate, as_of_date)} — any bank that fails to
+    fetch (e.g. a series code that's stale or renamed) is simply omitted
+    rather than breaking the page."""
     import pandas_datareader.data as web
     series = {
         "Federal Reserve (Fed Funds Rate)": "DFF",
         "Bank of Canada (Overnight Rate)": "IRSTCB01CAM156N",
         "Bank of England (Bank Rate)": "IRSTCB01GBM156N",
+        "European Central Bank (Deposit Rate)": "ECBDFR",
+        "Bank of Japan (Policy Rate)": "IRSTCB01JPM156N",
+        "Reserve Bank of Australia (Cash Rate)": "IRSTCB01AUM156N",
+        "Reserve Bank of New Zealand (OCR)": "IRSTCB01NZM156N",
+        "Swiss National Bank (Policy Rate)": "IRSTCB01CHM156N",
+        "Norges Bank (Key Policy Rate)": "IRSTCB01NOM156N",
+        "Riksbank (Policy Rate)": "IRSTCB01SEM156N",
     }
     end = date.today()
     start = end - timedelta(days=400)
@@ -576,6 +639,29 @@ def fetch_central_bank_rates():
             if not data.empty:
                 latest = data.iloc[-1]
                 results[name] = (float(latest.iloc[0]), data.index[-1].strftime("%Y-%m-%d"))
+        except Exception:
+            continue
+    return results
+
+
+@st.cache_data(ttl=60 * 15)  # 15-minute refresh so this stays close to live through the day
+def fetch_g10_currency_rates():
+    """G10 currency pairs, all quoted per 1 USD (except EUR/GBP which are
+    quoted as USD per unit, matching standard FX convention)."""
+    pairs = {
+        "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "USDJPY=X",
+        "USD/CAD": "USDCAD=X", "AUD/USD": "AUDUSD=X", "NZD/USD": "NZDUSD=X",
+        "USD/CHF": "USDCHF=X", "USD/SEK": "USDSEK=X", "USD/NOK": "USDNOK=X",
+    }
+    results = {}
+    for label, ticker in pairs.items():
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if not hist.empty:
+                latest_price = hist["Close"].iloc[-1]
+                prev_price = hist["Close"].iloc[-2] if len(hist) > 1 else latest_price
+                pct_change = (latest_price / prev_price - 1) * 100
+                results[label] = (latest_price, pct_change)
         except Exception:
             continue
     return results
@@ -743,6 +829,50 @@ with st.sidebar:
 st.caption("Builds a target asset allocation from your risk profile, horizon, and the prior trading day's market conditions.")
 
 
+def select_portfolio_for_page(widget_key: str):
+    """
+    Renders a dropdown letting the user choose between the portfolio currently
+    active on the Calculator page and any of their saved portfolios. Returns
+    a dict with weights/tickers/labels/amount/risk/horizon for whichever is
+    chosen, or None if nothing is available yet.
+    """
+    saved = load_saved_portfolios(username)
+    options = []
+    if st.session_state.current_weights:
+        options.append("Current Calculator Portfolio")
+    options += [p["name"] for p in saved]
+
+    if not options:
+        st.info("No portfolio available yet — build one on the Calculator page or save one first.")
+        return None
+
+    choice = st.selectbox("Portfolio to use", options, key=f"portfolio_choice_{widget_key}")
+
+    if choice == "Current Calculator Portfolio":
+        return {
+            "weights": st.session_state.current_weights,
+            "tickers_map": st.session_state.get("_combined_tickers", TICKERS),
+            "labels_map": st.session_state.get("_combined_labels", ASSET_LABELS),
+            "amount": st.session_state.current_amount,
+            "risk_profile": st.session_state.current_risk,
+            "horizon": st.session_state.current_horizon,
+            "stop_loss": st.session_state.stop_loss_pct,
+            "source": "calculator",
+        }
+    else:
+        p = next(sp for sp in saved if sp["name"] == choice)
+        tickers_map = dict(TICKERS)
+        labels_map = dict(ASSET_LABELS)
+        for key, v in p.get("custom_tickers", {}).items():
+            tickers_map[key] = v["ticker"]
+            labels_map[key] = f"{v['name']} ({v['ticker']})"
+        return {
+            "weights": p["weights"], "tickers_map": tickers_map, "labels_map": labels_map,
+            "amount": p["amount"], "risk_profile": p["risk_profile"], "horizon": p["horizon"],
+            "stop_loss": p.get("stop_loss"), "source": "saved", "date_saved": p["date_saved"],
+        }
+
+
 # =======================================================================
 # PAGE: DASHBOARD
 # =======================================================================
@@ -761,18 +891,45 @@ if page == "Dashboard":
     st.markdown("**Central Bank Policy Rates**")
     rates = fetch_central_bank_rates()
     if rates:
-        cols = st.columns(len(rates))
-        for col, (name, (rate, as_of_rate)) in zip(cols, rates.items()):
-            with col:
-                st.markdown(f"""
-                    <div class="kpi-box">
-                        <div class="label">{name}</div>
-                        <div class="value">{rate:.2f}%</div>
-                        <div class="asof">as of {as_of_rate}</div>
-                    </div>
-                """, unsafe_allow_html=True)
+        rate_items = list(rates.items())
+        for row_start in range(0, len(rate_items), 5):
+            row_items = rate_items[row_start:row_start + 5]
+            cols = st.columns(len(row_items))
+            for col, (name, (rate, as_of_rate)) in zip(cols, row_items):
+                with col:
+                    st.markdown(f"""
+                        <div class="kpi-box">
+                            <div class="label">{name}</div>
+                            <div class="value">{rate:.2f}%</div>
+                            <div class="asof">as of {as_of_rate}</div>
+                        </div>
+                    """, unsafe_allow_html=True)
     else:
         st.caption("Central bank rate data unavailable right now.")
+
+    st.divider()
+
+    st.markdown("**G10 Currency Rates**")
+    st.caption("Refreshes every 15 minutes throughout the trading day.")
+    fx = fetch_g10_currency_rates()
+    if fx:
+        fx_items = list(fx.items())
+        for row_start in range(0, len(fx_items), 5):
+            row_items = fx_items[row_start:row_start + 5]
+            cols = st.columns(len(row_items))
+            for col, (pair, (price, pct_change)) in zip(cols, row_items):
+                with col:
+                    arrow = "▲" if pct_change >= 0 else "▼"
+                    color = "#4ade80" if pct_change >= 0 else "#f87171"
+                    st.markdown(f"""
+                        <div class="kpi-box">
+                            <div class="label">{pair}</div>
+                            <div class="value">{price:.4f}</div>
+                            <div class="asof" style="color:{color}">{arrow} {abs(pct_change):.2f}%</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+    else:
+        st.caption("Currency rate data unavailable right now.")
 
     st.divider()
 
@@ -786,17 +943,20 @@ if page == "Dashboard":
 
         left, right = st.columns([1, 1.3])
         w = latest["weights"]
+        dash_labels = dict(ASSET_LABELS)
+        for key, v in latest.get("custom_tickers", {}).items():
+            dash_labels[key] = f"{v['name']} ({v['ticker']})"
         with left:
-            fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS.get(k, k) for k in w], values=[v * 100 for v in w.values()],
+            fig = go.Figure(data=[go.Pie(labels=[dash_labels.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                           hole=0.45, textinfo="label+percent")])
             fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
                                paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
             st.plotly_chart(fig, use_container_width=True, key="dash_pie")
         with right:
-            exp_ret = expected_return(w)
+            exp_ret = expected_return({k: v for k, v in w.items() if k in EXPECTED_RETURNS})
             st.metric("Illustrative Expected Annual Return", f"{exp_ret*100:.2f}%",
                        help="Based on long-run capital market assumptions per asset class — not a forecast.")
-            df = pd.DataFrame({"Asset": [ASSET_LABELS.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()]})
+            df = pd.DataFrame({"Asset": [dash_labels.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()]})
             st.dataframe(df, use_container_width=True, hide_index=True)
 
         st.caption(f"You have {len(portfolios)} saved portfolio{'s' if len(portfolios) != 1 else ''} total — see the Saved Portfolios page for all of them.")
@@ -842,13 +1002,13 @@ elif page == "Risk Questionnaire":
 elif page == "Calculator":
     col1, col2, col3 = st.columns(3)
     with col1:
-        amount = st.number_input("Investment Amount ($)", min_value=1.0, value=st.session_state.current_amount, step=500.0)
+        amount = st.number_input("Investment Amount ($)", min_value=1.0, max_value=10_000_000.0, value=min(st.session_state.current_amount, 10_000_000.0), step=500.0)
     with col2:
         risk_choice = st.selectbox("Risk Profile", [p.value for p in RiskProfile],
                                     index=[p.value for p in RiskProfile].index(st.session_state.current_risk))
     with col3:
-        horizon = st.number_input("Investment Horizon (years)", min_value=1, max_value=99,
-                                   value=st.session_state.current_horizon, step=1)
+        horizon = st.number_input("Investment Horizon (years)", min_value=1, max_value=50,
+                                   value=min(st.session_state.current_horizon, 50), step=1)
     st.caption(f"Horizon bucket: **{horizon_bucket_label(horizon)}** — the allocation tilt shifts every 2 years of horizon, not just at broad thresholds.")
 
     calculate = st.button("Calculate Portfolio")
@@ -876,7 +1036,7 @@ elif page == "Calculator":
         weights = dict(st.session_state.current_weights)
 
         st.divider()
-        st.subheader("➕ Add a Custom Ticker")
+        st.subheader("Add a Custom Ticker")
         st.caption("Search any North American ticker (e.g. AAPL, SHOP.TO, TSLA) to add it as its own holding.")
         cc1, cc2 = st.columns([2, 1])
         with cc1:
@@ -949,7 +1109,7 @@ elif page == "Calculator":
             st.markdown(f"**Total: ${amount:,.2f}**")
 
         st.divider()
-        st.subheader("✏️ Manually Override Weights")
+        st.subheader("Custom Weights")
         manual_weights = {}
         cols = st.columns(4)
         for i, k in enumerate(weights):
@@ -964,8 +1124,6 @@ elif page == "Calculator":
             st.success("Manual weights applied.")
             st.rerun()
 
-        st.divider()
-        st.subheader("✅ Data Validation")
         issues = []
         if abs(sum(weights.values()) - 1.0) > 0.01:
             issues.append(f"Weights sum to {sum(weights.values())*100:.1f}%, not 100%.")
@@ -977,20 +1135,20 @@ elif page == "Calculator":
                 if not is_valid:
                     issues.append(f"Ticker '{t}' could not be validated — data may be unavailable.")
         if issues:
+            st.divider()
+            st.subheader("Data Validation")
             for issue in issues:
                 st.warning(issue)
-        else:
-            st.success("All checks passed — weights sum to 100%, amount is valid, and all tickers resolved.")
 
         st.divider()
-        st.subheader("🛑 Stop-Loss Threshold")
+        st.subheader("Stop-Loss Threshold")
         stop_loss_pct = st.number_input("Stop-loss (% decline from peak value)", min_value=0.0, max_value=100.0,
                                          value=st.session_state.stop_loss_pct, step=1.0)
         st.session_state.stop_loss_pct = stop_loss_pct
         st.caption("Used on the Backtest tab to flag whether this threshold would have been breached historically.")
 
         st.divider()
-        st.subheader("📤 Export")
+        st.subheader("Export")
         exp1, exp2 = st.columns(2)
         with exp1:
             csv_bytes = build_csv(weights, amount, combined_labels, combined_tickers)
@@ -1003,14 +1161,22 @@ elif page == "Calculator":
                 st.error(f"PDF export failed: {e}")
 
         st.divider()
-        st.subheader("💾 Save This Portfolio")
+        st.subheader("Save This Portfolio")
+        existing_count = len(load_saved_portfolios(username))
+        st.caption(f"{existing_count}/{MAX_SAVED_PORTFOLIOS} saved portfolios used.")
         save_name = st.text_input("Portfolio name", placeholder="e.g. My Growth Mix")
         if st.button("Save Portfolio"):
-            if save_name.strip():
-                save_portfolio(username, save_name.strip(), amount, risk_choice, horizon, weights, stop_loss_pct)
-                st.success(f"Saved '{save_name}' to your account.")
-            else:
+            if not save_name.strip():
                 st.warning("Give your portfolio a name first.")
+            elif existing_count >= MAX_SAVED_PORTFOLIOS:
+                st.error(f"You've reached the {MAX_SAVED_PORTFOLIOS}-portfolio limit — delete one from the Saved Portfolios page before saving another.")
+            else:
+                saved_ok = save_portfolio(username, save_name.strip(), amount, risk_choice, horizon, weights,
+                                           stop_loss_pct, st.session_state.custom_tickers)
+                if saved_ok:
+                    st.success(f"Saved '{save_name}' to your account.")
+                else:
+                    st.error(f"You've reached the {MAX_SAVED_PORTFOLIOS}-portfolio limit — delete one from the Saved Portfolios page before saving another.")
 
         st.session_state["_combined_tickers"] = combined_tickers
         st.session_state["_combined_labels"] = combined_labels
@@ -1022,16 +1188,16 @@ elif page == "Calculator":
 # =======================================================================
 elif page == "Backtest & Risk":
     st.subheader("Historical Backtest")
-    if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator page first.")
-    else:
-        weights = st.session_state.current_weights
-        tickers_map = st.session_state.get("_combined_tickers", TICKERS)
+    selection = select_portfolio_for_page("backtest")
+    if selection:
+        weights = selection["weights"]
+        tickers_map = selection["tickers_map"]
+        stop_loss_pct = selection["stop_loss"] or 15.0
         bt_years = st.radio("Lookback period", [1, 5, 10], index=1, horizontal=True, format_func=lambda y: f"{y} year{'s' if y > 1 else ''}")
 
         if st.button("Run Backtest"):
             with st.spinner("Pulling historical data..."):
-                result = run_backtest(weights, tickers_map, bt_years, st.session_state.stop_loss_pct)
+                result = run_backtest(weights, tickers_map, bt_years, stop_loss_pct)
             st.session_state["_last_backtest"] = result
 
         result = st.session_state.get("_last_backtest")
@@ -1063,9 +1229,9 @@ elif page == "Backtest & Risk":
 
                 st.divider()
                 if result["stop_loss_breach_date"]:
-                    st.error(f"⚠️ Your stop-loss threshold of {st.session_state.stop_loss_pct:.0f}% would have been breached on {result['stop_loss_breach_date']} (max drawdown over this period: {result['max_drawdown']*100:.1f}%).")
+                    st.error(f"Your stop-loss threshold of {stop_loss_pct:.0f}% would have been breached on {result['stop_loss_breach_date']} (max drawdown over this period: {result['max_drawdown']*100:.1f}%).")
                 else:
-                    st.success(f"✅ Your stop-loss threshold of {st.session_state.stop_loss_pct:.0f}% was not breached over this period (max drawdown: {result['max_drawdown']*100:.1f}%).")
+                    st.success(f"Your stop-loss threshold of {stop_loss_pct:.0f}% was not breached over this period (max drawdown: {result['max_drawdown']*100:.1f}%).")
 
                 st.caption(f"Sharpe ratio assumes a {RISK_FREE_RATE*100:.1f}% annualized risk-free rate. Past performance is not indicative of future results.")
 
@@ -1077,12 +1243,12 @@ elif page == "Stress Testing":
     st.subheader("Stress Testing")
     st.caption("Applies the actual historical returns of your held assets during past crisis periods to your current weights — showing what would have happened, not a prediction of what will.")
 
-    if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator page first.")
-    else:
-        weights = st.session_state.current_weights
-        tickers_map = st.session_state.get("_combined_tickers", TICKERS)
-        amount = st.session_state.current_amount
+    selection = select_portfolio_for_page("stress")
+    if selection:
+        weights = selection["weights"]
+        tickers_map = selection["tickers_map"]
+        labels_map = selection["labels_map"]
+        amount = selection["amount"]
 
         scenario = st.selectbox("Scenario", list(STRESS_SCENARIOS.keys()))
         start, end = STRESS_SCENARIOS[scenario]
@@ -1099,8 +1265,7 @@ elif page == "Stress Testing":
             if result["portfolio_pct_impact"] is None:
                 st.error("No usable price data for this scenario — the held tickers may not have existed yet.")
             else:
-                impact_color = "🔴" if result["portfolio_pct_impact"] < 0 else "🟢"
-                st.metric(f"{impact_color} Estimated Portfolio Impact ({cached_scenario})",
+                st.metric(f"Estimated Portfolio Impact ({cached_scenario})",
                           f"{result['portfolio_pct_impact']*100:+.1f}%",
                           delta=f"${result['dollar_impact']:,.0f}")
                 st.caption(f"Based on {result['covered_weight']*100:.0f}% of your portfolio's weight (some assets may lack data this far back).")
@@ -1108,7 +1273,6 @@ elif page == "Stress Testing":
                 if result["missing"]:
                     st.warning(f"No historical data available for: {', '.join(result['missing'])} — excluded from this estimate.")
 
-                labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
                 asset_df = pd.DataFrame({
                     "Asset Class": [labels_map.get(k, k) for k in result["per_asset_impact"]],
                     "Change During Scenario": [f"{v*100:+.1f}%" for v in result["per_asset_impact"].values()],
@@ -1122,22 +1286,20 @@ elif page == "Stress Testing":
 elif page == "Efficient Frontier":
     st.subheader("Efficient Frontier (Monte Carlo)")
 
-    if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator page first.")
-    else:
-        weights = st.session_state.current_weights
-        tickers_map = st.session_state.get("_combined_tickers", TICKERS)
-        labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
+    selection = select_portfolio_for_page("frontier")
+    if selection:
+        weights = selection["weights"]
+        tickers_map = selection["tickers_map"]
+        labels_map = selection["labels_map"]
         held_names = [labels_map.get(k, k) for k, w in weights.items() if w > 0]
 
         fr_years = st.radio("Lookback period", [1, 5, 10], index=1, horizontal=True,
                              format_func=lambda y: f"{y} year{'s' if y > 1 else ''}", key="frontier_years")
 
         st.caption(
-            f"Frontier for: **{st.session_state.current_risk} profile, ${st.session_state.current_amount:,.0f}, "
-            f"{st.session_state.current_horizon}yr horizon** — simulated using your currently held assets "
-            f"({', '.join(held_names)}) over the selected lookback period. This always reflects whatever "
-            f"portfolio is currently active on the Calculator page, including manual overrides and custom tickers. "
+            f"Frontier for: **{selection['risk_profile']} profile, ${selection['amount']:,.0f}, "
+            f"{selection['horizon']}yr horizon** — simulated using the currently held assets "
+            f"({', '.join(held_names)}) over the selected lookback period. "
             f"3,000 random-weight portfolios are simulated across these assets; cash is excluded from the "
             f"simulation itself (it has no price series) but is folded into the risk-free contribution."
         )
@@ -1225,12 +1387,11 @@ elif page == "Sensitivity Index":
 
     st.divider()
 
-    if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator page first.")
-    else:
-        weights = st.session_state.current_weights
-        tickers_map = st.session_state.get("_combined_tickers", TICKERS)
-        labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
+    selection = select_portfolio_for_page("sensitivity")
+    if selection:
+        weights = selection["weights"]
+        tickers_map = selection["tickers_map"]
+        labels_map = selection["labels_map"]
         tickers_used = {k: tickers_map[k] for k in weights if tickers_map.get(k) is not None}
 
         if st.button("Calculate Sensitivity"):
@@ -1286,11 +1447,17 @@ elif page == "Rebalancing Simulator":
         selected_idx = st.selectbox("Choose a saved portfolio", range(len(options)), format_func=lambda i: options[i])
         chosen = portfolios[selected_idx]
 
+        tickers_map = dict(TICKERS)
+        labels_map = dict(ASSET_LABELS)
+        for key, v in chosen.get("custom_tickers", {}).items():
+            tickers_map[key] = v["ticker"]
+            labels_map[key] = f"{v['name']} ({v['ticker']})"
+
         drift_threshold = st.slider("Rebalancing threshold (%)", 1, 20, 5)
 
         if st.button("Simulate Drift"):
             with st.spinner("Pulling price history since the save date..."):
-                result = simulate_rebalancing(chosen["weights"], TICKERS, chosen["amount"], chosen["date_saved"])
+                result = simulate_rebalancing(chosen["weights"], tickers_map, chosen["amount"], chosen["date_saved"])
             st.session_state["_rebal_result"] = result
 
         result = st.session_state.get("_rebal_result")
@@ -1309,12 +1476,12 @@ elif page == "Rebalancing Simulator":
                     breach = abs(drift) * 100 > drift_threshold
                     any_breach = any_breach or breach
                     rows.append({
-                        "Asset Class": ASSET_LABELS.get(k, k),
+                        "Asset Class": labels_map.get(k, k),
                         "Target Weight": f"{target*100:.1f}%",
                         "Current Weight": f"{current*100:.1f}%",
                         "Drift": f"{drift*100:+.1f}%",
                         "Suggested Trade": f"{'Buy' if result['trades_needed'][k] > 0 else 'Sell'} ${abs(result['trades_needed'][k]):,.0f}",
-                        "Breach?": "⚠️ Yes" if breach else "No",
+                        "Breach?": "Yes" if breach else "No",
                     })
 
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -1330,13 +1497,13 @@ elif page == "Rebalancing Simulator":
 # =======================================================================
 elif page == "Quarterly Views":
     st.subheader("Quarterly Portfolio Views")
-    st.caption("Shows how the recommended allocation for your current risk profile and horizon would have looked at the start of each of the last 4 quarters, based on historical market conditions at that time.")
+    st.caption("Shows how your selected portfolio's allocation would have looked at the start of each of the last 4 quarters, based on historical market conditions at that time.")
 
-    if not st.session_state.current_weights:
-        st.info("Calculate a portfolio on the Calculator page first, so a risk profile and horizon are set.")
-    else:
-        risk_profile = RiskProfile(st.session_state.current_risk)
-        horizon = st.session_state.current_horizon
+    selection = select_portfolio_for_page("quarterly")
+    if selection:
+        base_weights = selection["weights"]
+        horizon = selection["horizon"]
+        labels_map = selection["labels_map"]
 
         today = date.today()
         quarter_starts = []
@@ -1351,7 +1518,7 @@ elif page == "Quarterly Views":
                 quarterly_data = []
                 for q_date in quarter_starts:
                     hist_score = historical_market_condition_score(q_date.strftime("%Y-%m-%d"))
-                    w = build_portfolio(risk_profile, horizon, hist_score)
+                    w = apply_tactical_tilt(base_weights, horizon, hist_score)
                     quarterly_data.append((q_date, hist_score, w))
                 st.session_state["_quarterly"] = quarterly_data
 
@@ -1362,7 +1529,7 @@ elif page == "Quarterly Views":
                 with col:
                     st.markdown(f"**{q_date.strftime('%b %Y')}**")
                     st.caption(f"Market score: {hist_score:+.2f}" if hist_score is not None else "Market score: N/A")
-                    fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in w], values=[v * 100 for v in w.values()],
+                    fig = go.Figure(data=[go.Pie(labels=[labels_map.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                                   hole=0.45, textinfo="percent")])
                     fig.update_layout(showlegend=False, height=220, margin=dict(t=10, b=10, l=10, r=10),
                                        paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
@@ -1371,7 +1538,7 @@ elif page == "Quarterly Views":
             st.divider()
             st.markdown("**Weight Evolution by Asset Class**")
             evo_df = pd.DataFrame({
-                q_date.strftime("%b %Y"): {ASSET_LABELS[k]: round(v * 100, 1) for k, v in w.items()}
+                q_date.strftime("%b %Y"): {labels_map.get(k, k): round(v * 100, 1) for k, v in w.items()}
                 for q_date, _, w in quarterly_data
             }).T
             st.dataframe(evo_df, use_container_width=True)
@@ -1382,8 +1549,8 @@ elif page == "Quarterly Views":
 # =======================================================================
 elif page == "Compare Profiles":
     st.subheader("Compare All Risk Profiles")
-    compare_amount = st.number_input("Amount for comparison ($)", min_value=1.0, value=20000.0, step=500.0, key="compare_amount")
-    compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=99, value=10, key="compare_horizon")
+    compare_amount = st.number_input("Amount for comparison ($)", min_value=1.0, max_value=10_000_000.0, value=20000.0, step=500.0, key="compare_amount")
+    compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=50, value=10, key="compare_horizon")
 
     score, as_of, _ = market_condition_score(str(date.today()))
     cols = st.columns(3)
@@ -1406,18 +1573,20 @@ elif page == "Compare Profiles":
 # =======================================================================
 elif page == "Market News":
     st.subheader("Recent News by Asset Class")
-    tickers_map = st.session_state.get("_combined_tickers", TICKERS)
-    labels_map = st.session_state.get("_combined_labels", ASSET_LABELS)
-    news_by_class = fetch_news_for_asset_classes(tickers_map)
-    for key, headlines in news_by_class.items():
-        st.markdown(f"**{labels_map.get(key,key)}** ({tickers_map[key]})")
-        if not headlines:
-            st.caption("No recent headlines available.")
-        else:
-            for h in headlines:
-                pub = f" — *{h['publisher']}*" if h["publisher"] else ""
-                st.markdown(f"- [{h['title']}]({h['link']}){pub}" if h["link"] else f"- {h['title']}{pub}")
-        st.markdown("")
+    selection = select_portfolio_for_page("news")
+    if selection:
+        tickers_map = selection["tickers_map"]
+        labels_map = selection["labels_map"]
+        news_by_class = fetch_news_for_asset_classes(tickers_map)
+        for key, headlines in news_by_class.items():
+            st.markdown(f"**{labels_map.get(key,key)}** ({tickers_map[key]})")
+            if not headlines:
+                st.caption("No recent headlines available.")
+            else:
+                for h in headlines:
+                    pub = f" — *{h['publisher']}*" if h["publisher"] else ""
+                    st.markdown(f"- [{h['title']}]({h['link']}){pub}" if h["link"] else f"- {h['title']}{pub}")
+            st.markdown("")
 
 
 # =======================================================================
@@ -1433,7 +1602,10 @@ elif page == "Saved Portfolios":
             sl = f", stop-loss {p['stop_loss']:.0f}%" if p.get("stop_loss") else ""
             with st.expander(f"**{p['name']}** — saved {p['date_saved']} ({p['risk_profile']}, {p['horizon']}yr, ${p['amount']:,.0f}{sl})"):
                 w = p["weights"]
-                df = pd.DataFrame({"Asset": [ASSET_LABELS.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
+                p_labels = dict(ASSET_LABELS)
+                for key, v in p.get("custom_tickers", {}).items():
+                    p_labels[key] = f"{v['name']} ({v['ticker']})"
+                df = pd.DataFrame({"Asset": [p_labels.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
                                     "$": [f"${p['amount']*v:,.0f}" for v in w.values()]})
                 st.dataframe(df, use_container_width=True, hide_index=True)
                 if st.button("Delete", key=f"delete_{i}"):

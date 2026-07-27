@@ -878,7 +878,12 @@ authenticator = stauth.Authenticate(
 )
 
 if not st.session_state.get("authentication_status"):
-    st.title("📊 Wealthscope")
+    logo_col, title_col = st.columns([1, 5])
+    with logo_col:
+        if os.path.exists(LOGO_PATH):
+            st.image(LOGO_PATH, width=90)
+    with title_col:
+        st.title("Wealthscope")
     st.caption("Log in or create an account to build and save portfolios.")
     login_tab, register_tab = st.tabs(["Login", "Register"])
     with login_tab:
@@ -911,7 +916,7 @@ if "custom_expected_returns" not in st.session_state:
     st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
 
 with st.sidebar:
-    st.markdown("### 📊 Wealthscope")
+    st.markdown("### Wealthscope")
     st.write(f"Logged in as **{st.session_state['name']}**")
     authenticator.logout()
     st.divider()

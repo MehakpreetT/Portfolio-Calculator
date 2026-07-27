@@ -2,7 +2,7 @@
 
 A live portfolio construction web app that builds a target asset allocation from a user's risk profile, investment horizon, and current market conditions — then lets them backtest it, stress-test it, analyze its sensitivity to macro factors, simulate rebalancing, and track it over time. Supports user accounts so each person's portfolios stay private and saved.
 
-**Live app:** https://portfolio-calculator-c4n2sqxe8zkfqttgtzpbg6.streamlit.app/
+**Live app:** https://wealthscope1.streamlit.app/
 
 Built with Python and Streamlit.
 

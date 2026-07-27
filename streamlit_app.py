@@ -1,5 +1,5 @@
 """
-PortPicker — Forward-Looking Portfolio Construction Web App
+Wealthscope — Forward-Looking Portfolio Construction Web App
 --------------------------------------------------------------
 Run locally with:  streamlit run streamlit_app.py
 
@@ -753,7 +753,7 @@ def build_pdf(weights, amount, risk_profile, horizon, labels_map, tickers_map):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "PortPicker - Portfolio Allocation Report", ln=True)
+    pdf.cell(0, 10, "Wealthscope - Portfolio Allocation Report", ln=True)
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 8, f"Generated: {date.today()}", ln=True)
     pdf.cell(0, 8, f"Amount: ${amount:,.2f}   Risk Profile: {risk_profile}   Horizon: {horizon} yrs", ln=True)
@@ -778,7 +778,7 @@ def build_pdf(weights, amount, risk_profile, horizon, labels_map, tickers_map):
 # =======================================================================
 # 12. PAGE CONFIG + STYLE
 # =======================================================================
-st.set_page_config(page_title="PortPicker", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Wealthscope", page_icon="📊", layout="wide")
 
 # Custom logo — drop your image at assets/logo.png (repo root) and it'll show
 # in the sidebar and browser tab automatically. Falls back silently if missing.
@@ -878,7 +878,7 @@ authenticator = stauth.Authenticate(
 )
 
 if not st.session_state.get("authentication_status"):
-    st.title("📊 PortPicker")
+    st.title("📊 Wealthscope")
     st.caption("Log in or create an account to build and save portfolios.")
     login_tab, register_tab = st.tabs(["Login", "Register"])
     with login_tab:
@@ -911,7 +911,7 @@ if "custom_expected_returns" not in st.session_state:
     st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
 
 with st.sidebar:
-    st.markdown("### 📊 PortPicker")
+    st.markdown("### 📊 Wealthscope")
     st.write(f"Logged in as **{st.session_state['name']}**")
     authenticator.logout()
     st.divider()
@@ -1237,6 +1237,8 @@ elif page == "Calculator":
                     ) / 100
             if st.button("Reset to Default Assumptions"):
                 st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
+                for k in EXPECTED_RETURNS:
+                    st.session_state[f"exp_ret_{k}"] = EXPECTED_RETURNS[k] * 100
                 st.rerun()
 
         left, right = st.columns([1, 1.3])
@@ -1591,7 +1593,7 @@ elif page == "Rebalancing Simulator":
 
     with st.expander("How this works"):
         st.markdown("""
-        When you save a portfolio, PortPicker records its target weights, the dollar amount, and the save date.
+        When you save a portfolio, Wealthscope records its target weights, the dollar amount, and the save date.
         This tool then:
         1. Pulls actual historical prices for each holding from the save date to today
         2. Calculates how many "shares" your dollar amount would have bought at the save-date price

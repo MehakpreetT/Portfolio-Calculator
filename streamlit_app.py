@@ -780,97 +780,141 @@ def build_pdf(weights, amount, risk_profile, horizon, labels_map, tickers_map):
 # =======================================================================
 st.set_page_config(page_title="Wealthscope", page_icon="📊", layout="wide")
 
-# Custom logo — drop your image at assets/logo.png (repo root) and it'll show
-# in the sidebar and browser tab automatically. Falls back silently if missing.
 LOGO_PATH = "assets/logo.png"
-if os.path.exists(LOGO_PATH):
-    try:
-        st.logo(LOGO_PATH, size="large")
-    except Exception:
-        pass
 
-st.markdown("""
-    <style>
-        .main { background-color: #0e1117; }
-        h1, h2, h3 { color: #e8eaed; letter-spacing: -0.3px; }
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"
 
-        /* Gradient app title */
-        h1 {
-            background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 50%, #60a5fa 100%);
-            background-size: 200% auto;
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-            background-clip: text;
-            animation: shine 6s linear infinite;
-        }
-        @keyframes shine { to { background-position: 200% center; } }
+THEME_PALETTES = {
+    "dark": {
+        "bg": "#0a0e1a", "bg_gradient_end": "#0e1117",
+        "card": "#171b24", "card_gradient_end": "#131722",
+        "border": "#2b2f38", "border_hover": "#3b82f6",
+        "text": "#e8eaed", "text_muted": "#9aa0ab", "text_faint": "#6b7280",
+        "accent": "#60a5fa", "accent2": "#3b82f6", "accent_strong": "#2563eb", "accent_deep": "#1d4ed8",
+        "sidebar_start": "#10131a", "sidebar_end": "#0c0e13",
+        "input_bg": "#171b24", "shadow": "rgba(59, 130, 246, 0.18)",
+    },
+    "light": {
+        "bg": "#ffffff", "bg_gradient_end": "#eef2fb",
+        "card": "#ffffff", "card_gradient_end": "#f4f7fd",
+        "border": "#dbe3f0", "border_hover": "#2554c7",
+        "text": "#132049", "text_muted": "#4b5a80", "text_faint": "#7688ab",
+        "accent": "#2554c7", "accent2": "#1e40af", "accent_strong": "#1a3a99", "accent_deep": "#132c7a",
+        "sidebar_start": "#f4f7fd", "sidebar_end": "#e9eefb",
+        "input_bg": "#ffffff", "shadow": "rgba(37, 84, 199, 0.15)",
+    },
+}
 
-        [data-testid="stMetricValue"] { color: #e8eaed; }
-        [data-testid="stMetric"] {
-            background-color: #171b24; border: 1px solid #2b2f38;
-            border-radius: 10px; padding: 12px 16px;
-            transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
-        }
-        [data-testid="stMetric"]:hover {
-            transform: translateY(-2px);
-            border-color: #3b82f6;
-            box-shadow: 0 4px 16px rgba(59, 130, 246, 0.15);
-        }
 
-        .stButton>button {
-            background: linear-gradient(135deg, #2563eb, #3b82f6);
-            color: white; border: none; border-radius: 8px;
-            font-weight: 600; padding: 0.5em 1.5em;
-            transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.2s ease;
-        }
-        .stButton>button:hover {
-            background: linear-gradient(135deg, #1d4ed8, #2563eb);
-            color: white; transform: translateY(-1px);
-            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
-        }
-        .stButton>button:active { transform: translateY(0px); }
+def render_theme_css(theme_name: str):
+    p = THEME_PALETTES[theme_name]
+    st.markdown(f"""
+        <style>
+            .main, [data-testid="stAppViewContainer"] {{
+                background: linear-gradient(160deg, {p['bg']} 0%, {p['bg_gradient_end']} 100%);
+            }}
+            .main *, [data-testid="stAppViewContainer"] p, [data-testid="stAppViewContainer"] span,
+            [data-testid="stAppViewContainer"] label, [data-testid="stMarkdownContainer"] {{
+                color: {p['text']};
+            }}
+            h1, h2, h3 {{ color: {p['text']}; letter-spacing: -0.3px; }}
 
-        .stDownloadButton>button {
-            background-color: #1f2937; color: white; border: 1px solid #374151; border-radius: 8px;
-            transition: border-color 0.15s ease;
-        }
-        .stDownloadButton>button:hover { border-color: #60a5fa; }
+            h1 {{
+                background: linear-gradient(90deg, {p['accent']} 0%, {p['accent_strong']} 50%, {p['accent']} 100%);
+                background-size: 200% auto;
+                -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                background-clip: text;
+                animation: shine 6s linear infinite;
+            }}
+            @keyframes shine {{ to {{ background-position: 200% center; }} }}
 
-        section[data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #10131a 0%, #0c0e13 100%);
-            border-right: 1px solid #232733;
-        }
+            [data-testid="stMetricValue"] {{ color: {p['text']}; }}
+            [data-testid="stMetricLabel"] {{ color: {p['text_muted']}; }}
+            [data-testid="stMetric"] {{
+                background: linear-gradient(160deg, {p['card']} 0%, {p['card_gradient_end']} 100%);
+                border: 1px solid {p['border']};
+                border-radius: 10px; padding: 12px 16px;
+                transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+            }}
+            [data-testid="stMetric"]:hover {{
+                transform: translateY(-2px);
+                border-color: {p['border_hover']};
+                box-shadow: 0 4px 16px {p['shadow']};
+            }}
 
-        .edu-card, .kpi-card {
-            background-color: #171b24; border: 1px solid #2b2f38; border-radius: 10px;
-            padding: 16px 20px; margin-bottom: 14px;
-            transition: transform 0.15s ease, border-color 0.15s ease;
-        }
-        .edu-card:hover { transform: translateY(-2px); border-color: #3b3f4d; }
-        .edu-card h4 { margin: 0 0 8px 0; color: #60a5fa; }
+            .stButton>button {{
+                background: linear-gradient(135deg, {p['accent_strong']}, {p['accent']});
+                color: white; border: none; border-radius: 8px;
+                font-weight: 600; padding: 0.5em 1.5em;
+                transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.2s ease;
+            }}
+            .stButton>button:hover {{
+                background: linear-gradient(135deg, {p['accent_deep']}, {p['accent_strong']});
+                color: white; transform: translateY(-1px);
+                box-shadow: 0 4px 14px {p['shadow']};
+            }}
+            .stButton>button:active {{ transform: translateY(0px); }}
 
-        .kpi-row { display: flex; gap: 14px; flex-wrap: wrap; }
-        .kpi-box {
-            background: linear-gradient(160deg, #171b24 0%, #14171f 100%);
-            border: 1px solid #2b2f38; border-radius: 10px;
-            padding: 14px 18px; flex: 1; min-width: 180px;
-            transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
-        }
-        .kpi-box:hover {
-            transform: translateY(-2px);
-            border-color: #3b82f6;
-            box-shadow: 0 4px 16px rgba(59, 130, 246, 0.12);
-        }
-        .kpi-box .label { color: #9aa0ab; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .kpi-box .value { color: #e8eaed; font-size: 24px; font-weight: 700; margin-top: 4px; }
-        .kpi-box .asof { color: #6b7280; font-size: 11px; margin-top: 2px; }
+            .stDownloadButton>button {{
+                background-color: {p['card']}; color: {p['text']}; border: 1px solid {p['border']}; border-radius: 8px;
+                transition: border-color 0.15s ease;
+            }}
+            .stDownloadButton>button:hover {{ border-color: {p['accent']}; }}
 
-        /* Smooth fade-in for the whole page body on load/rerun */
-        [data-testid="stAppViewContainer"] > .main {
-            animation: fadeIn 0.35s ease-in;
-        }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    </style>
-""", unsafe_allow_html=True)
+            section[data-testid="stSidebar"] {{
+                background: linear-gradient(180deg, {p['sidebar_start']} 0%, {p['sidebar_end']} 100%);
+                border-right: 1px solid {p['border']};
+            }}
+            section[data-testid="stSidebar"] * {{ color: {p['text']}; }}
+
+            [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+            .stSelectbox [data-baseweb="select"] {{
+                background-color: {p['input_bg']} !important;
+                color: {p['text']} !important;
+                border-color: {p['border']} !important;
+            }}
+
+            .edu-card, .kpi-card {{
+                background: linear-gradient(160deg, {p['card']} 0%, {p['card_gradient_end']} 100%);
+                border: 1px solid {p['border']}; border-radius: 10px;
+                padding: 16px 20px; margin-bottom: 14px;
+                transition: transform 0.15s ease, border-color 0.15s ease;
+            }}
+            .edu-card:hover {{ transform: translateY(-2px); border-color: {p['border_hover']}; }}
+            .edu-card h4 {{ margin: 0 0 8px 0; color: {p['accent']}; }}
+
+            .kpi-row {{ display: flex; gap: 14px; flex-wrap: wrap; }}
+            .kpi-box {{
+                background: linear-gradient(160deg, {p['card']} 0%, {p['card_gradient_end']} 100%);
+                border: 1px solid {p['border']}; border-radius: 10px;
+                padding: 14px 18px; flex: 1; min-width: 180px;
+                transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+            }}
+            .kpi-box:hover {{
+                transform: translateY(-2px);
+                border-color: {p['border_hover']};
+                box-shadow: 0 4px 16px {p['shadow']};
+            }}
+            .kpi-box .label {{ color: {p['text_muted']}; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }}
+            .kpi-box .value {{ color: {p['text']}; font-size: 24px; font-weight: 700; margin-top: 4px; }}
+            .kpi-box .asof {{ color: {p['text_faint']}; font-size: 11px; margin-top: 2px; }}
+
+            .login-card {{
+                background: linear-gradient(160deg, {p['card']} 0%, {p['card_gradient_end']} 100%);
+                border: 1px solid {p['border']}; border-radius: 16px;
+                padding: 40px 44px; margin-top: 20px;
+                box-shadow: 0 8px 32px {p['shadow']};
+            }}
+            .login-tagline {{ color: {p['text_muted']}; font-size: 14px; letter-spacing: 1px; text-transform: uppercase; }}
+
+            [data-testid="stAppViewContainer"] {{ animation: fadeIn 0.35s ease-in; }}
+            @keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+        </style>
+    """, unsafe_allow_html=True)
+
+
+render_theme_css(st.session_state.theme)
 
 config = load_or_create_user_config()
 authenticator = stauth.Authenticate(
@@ -878,26 +922,43 @@ authenticator = stauth.Authenticate(
 )
 
 if not st.session_state.get("authentication_status"):
-    logo_col, title_col = st.columns([1, 5])
-    with logo_col:
+    _, toggle_col = st.columns([5, 1])
+    with toggle_col:
+        theme_choice = st.selectbox("Theme", ["Dark", "Light"], index=0 if st.session_state.theme == "dark" else 1,
+                                     key="_theme_toggle_login", label_visibility="collapsed")
+        new_theme = theme_choice.lower()
+        if new_theme != st.session_state.theme:
+            st.session_state.theme = new_theme
+            st.rerun()
+
+    left_pad, center, right_pad = st.columns([1, 2, 1])
+    with center:
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+
         if os.path.exists(LOGO_PATH):
-            st.image(LOGO_PATH, width=90)
-    with title_col:
-        st.title("Wealthscope")
-    st.caption("Log in or create an account to build and save portfolios.")
-    login_tab, register_tab = st.tabs(["Login", "Register"])
-    with login_tab:
-        authenticator.login()
-        if st.session_state.get("authentication_status") is False:
-            st.error("Username or password is incorrect.")
-    with register_tab:
-        try:
-            email, username, name = authenticator.register_user(pre_authorized=None)
-            if email:
-                save_user_config(config)
-                st.success("Account created — please log in from the Login tab.")
-        except Exception as e:
-            st.error(str(e))
+            logo_l, logo_c, logo_r = st.columns([1, 1, 1])
+            with logo_c:
+                st.image(LOGO_PATH, width=140)
+
+        st.markdown("<h1 style='text-align:center; margin-bottom:0;'>Wealthscope</h1>", unsafe_allow_html=True)
+        st.markdown("<p class='login-tagline' style='text-align:center;'>Insight. Growth. Wealth.</p>", unsafe_allow_html=True)
+        st.caption("Log in or create an account to build and save portfolios.")
+
+        login_tab, register_tab = st.tabs(["Login", "Register"])
+        with login_tab:
+            authenticator.login()
+            if st.session_state.get("authentication_status") is False:
+                st.error("Username or password is incorrect.")
+        with register_tab:
+            try:
+                email, username, name = authenticator.register_user(pre_authorized=None)
+                if email:
+                    save_user_config(config)
+                    st.success("Account created — please log in from the Login tab.")
+            except Exception as e:
+                st.error(str(e))
+
+        st.markdown('</div>', unsafe_allow_html=True)
     st.stop()
 
 # =======================================================================
@@ -916,10 +977,23 @@ if "custom_expected_returns" not in st.session_state:
     st.session_state.custom_expected_returns = dict(EXPECTED_RETURNS)
 
 with st.sidebar:
-    st.markdown("### Wealthscope")
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=140)
+    else:
+        st.markdown("### Wealthscope")
     st.write(f"Logged in as **{st.session_state['name']}**")
+
+    theme_choice = st.selectbox("Theme", ["Dark", "Light"], index=0 if st.session_state.theme == "dark" else 1,
+                                 key="_theme_toggle_sidebar")
+    new_theme = theme_choice.lower()
+    if new_theme != st.session_state.theme:
+        st.session_state.theme = new_theme
+        st.rerun()
+
     authenticator.logout()
     st.divider()
+
+    _p = THEME_PALETTES[st.session_state.theme]
     page = option_menu(
         menu_title=None,
         options=["Dashboard", "Risk Questionnaire", "Calculator", "Backtest & Risk", "Stress Testing",
@@ -930,10 +1004,10 @@ with st.sidebar:
                "bar-chart-steps", "newspaper", "save", "mortarboard", "book"],
         default_index=0,
         styles={
-            "container": {"padding": "0", "background-color": "#10131a"},
-            "icon": {"color": "#60a5fa", "font-size": "15px"},
-            "nav-link": {"font-size": "13px", "color": "#c9ccd3", "--hover-color": "#1a1e29"},
-            "nav-link-selected": {"background-color": "#1d4ed8"},
+            "container": {"padding": "0", "background-color": _p["sidebar_start"]},
+            "icon": {"color": _p["accent"], "font-size": "15px"},
+            "nav-link": {"font-size": "13px", "color": _p["text"], "--hover-color": _p["card"]},
+            "nav-link-selected": {"background-color": _p["accent_strong"]},
         },
     )
 
@@ -1064,7 +1138,7 @@ if page == "Dashboard":
             fig = go.Figure(data=[go.Pie(labels=[dash_labels.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                           hole=0.45, textinfo="label+percent")])
             fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
-                               paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                               paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
             st.plotly_chart(fig, use_container_width=True, key="dash_pie")
         with right:
             exp_ret = expected_return({k: v for k, v in w.items() if k in EXPECTED_RETURNS})
@@ -1261,7 +1335,7 @@ elif page == "Calculator":
                 hole=0.45, textinfo="label+percent",
             )])
             fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
-                               paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                               paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
             st.plotly_chart(fig, use_container_width=True, key="calc_pie")
         with right:
             df = pd.DataFrame({
@@ -1376,7 +1450,7 @@ elif page == "Backtest & Risk":
                 fig.add_trace(go.Scatter(x=result["bench_cumulative"].index, y=result["bench_cumulative"],
                                           name="60/40 Benchmark", line=dict(color="#95a5a6", width=2, dash="dash")))
                 fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                   font=dict(color="#e8eaed"), legend=dict(orientation="h"), yaxis_title="Growth of $100")
+                                   font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]), legend=dict(orientation="h"), yaxis_title="Growth of $100")
                 st.plotly_chart(fig, use_container_width=True)
 
                 c1, c2 = st.columns(2)
@@ -1512,7 +1586,7 @@ elif page == "Efficient Frontier":
                 ))
             fig.update_layout(
                 xaxis_title="Annualized Volatility", yaxis_title="Annualized Return",
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]),
                 legend=dict(orientation="h"),
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -1714,7 +1788,7 @@ elif page == "Quarterly Views":
                     fig = go.Figure(data=[go.Pie(labels=[labels_map.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                                   hole=0.45, textinfo="percent")])
                     fig.update_layout(showlegend=False, height=220, margin=dict(t=10, b=10, l=10, r=10),
-                                       paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                                       paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
                     st.plotly_chart(fig, use_container_width=True, key=f"q_pie_{q_date}")
 
             st.divider()
@@ -1746,7 +1820,7 @@ elif page == "Compare Profiles":
                 fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in w], values=[v * 100 for v in w.values()],
                                               hole=0.45, textinfo="percent")])
                 fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),
-                                   paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                                   paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
                 st.plotly_chart(fig, use_container_width=True, key=f"compare_pie_{i}")
                 df = pd.DataFrame({"Asset": [ASSET_LABELS[k] for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
                                     "$": [f"${compare_amount*v:,.0f}" for v in w.values()]})
@@ -1776,7 +1850,7 @@ elif page == "Compare Profiles":
                         fig = go.Figure(data=[go.Pie(labels=[p_labels.get(k, k) for k in w], values=[v * 100 for v in w.values()],
                                                       hole=0.45, textinfo="percent")])
                         fig.update_layout(showlegend=False, height=250, margin=dict(t=10, b=10, l=10, r=10),
-                                           paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"))
+                                           paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
                         st.plotly_chart(fig, use_container_width=True, key=f"saved_compare_pie_{i}")
                         df = pd.DataFrame({"Asset": [p_labels.get(k, k) for k in w], "Weight": [f"{v*100:.1f}%" for v in w.values()],
                                             "$": [f"${p['amount']*v:,.0f}" for v in w.values()]})
@@ -1879,7 +1953,7 @@ elif page == "Strategy Guide":
                 fig = go.Figure(data=[go.Pie(labels=[ASSET_LABELS[k] for k in mix], values=[v * 100 for v in mix.values()],
                                               hole=0.45, textinfo="label+percent")])
                 fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
-                                   paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#e8eaed"), height=280)
+                                   paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]), height=280)
                 st.plotly_chart(fig, use_container_width=True, key=f"strategy_pie_{profile.value}")
             with c2:
                 st.markdown(f"**Philosophy:** {notes['philosophy']}")

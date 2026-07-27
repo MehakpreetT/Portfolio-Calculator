@@ -3,9 +3,6 @@ PortPicker — Forward-Looking Portfolio Construction Web App
 --------------------------------------------------------------
 Run locally with:  streamlit run streamlit_app.py
 
-Login: first run auto-creates a default account file (users.yaml) with
-a seeded test account (username: testuser, password: test1234).
-
 Pages (left sidebar once logged in):
   Dashboard, Risk Questionnaire, Calculator, Backtest & Risk,
   Stress Testing, Efficient Frontier, Sensitivity Index,

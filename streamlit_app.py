@@ -736,40 +736,41 @@ def fetch_news_for_asset_classes(tickers_map):
     return news_by_class
 
 
-DAILY_BRIEFING_SECTORS = {
-    "Investment Product Advisory": ["BLK", "TROW", "SCHW"],
-    "FX Market": ["UUP", "FXE", "FXY"],
-    "Metals & Mining": ["GLD", "GDX", "XME"],
-    "Bond Market": ["TLT", "AGG", "LQD"],
+DAILY_BRIEFING_FEEDS = {
+    "Investment Product Advisory": "https://www.investing.com/rss/320.rss",       # ETF Analysis & Opinion
+    "FX Market": "https://www.investing.com/rss/news_1.rss",                     # Forex News
+    "Metals & Mining": "https://www.investing.com/rss/commodities_Metals.rss",   # Metals Analysis
+    "Bond Market": "https://www.investing.com/rss/bonds.rss",                   # Bonds Analysis & Opinion
 }
 
 
 @st.cache_data(ttl=60 * 60 * 4)
 def fetch_daily_briefing():
+    """
+    Pulls real, topic-specific RSS feeds (not ticker-based proxies) so each
+    section actually matches its subject — e.g. Investment Product Advisory
+    pulls genuine ETF/fund-launch/AUM news, not just an asset manager's stock
+    price headlines.
+    """
+    import requests
+    import xml.etree.ElementTree as ET
+
     briefing = {}
-    for sector, tickers in DAILY_BRIEFING_SECTORS.items():
+    for sector, feed_url in DAILY_BRIEFING_FEEDS.items():
         headlines = []
-        for ticker in tickers:
-            try:
-                items = yf.Ticker(ticker).news[:3]
-                for item in items:
-                    content = item.get("content", item)
-                    title = content.get("title") or item.get("title", "Untitled")
-                    link = (content.get("canonicalUrl") or {}).get("url") or item.get("link", "")
-                    publisher = (content.get("provider") or {}).get("displayName", "")
-                    pub_date = (content.get("pubDate") or content.get("displayTime") or "")
-                    headlines.append({"title": title, "link": link, "publisher": publisher,
-                                      "source_ticker": ticker, "pub_date": pub_date})
-            except Exception:
-                continue
-        # De-duplicate identical headlines pulled from multiple tickers in the same sector
-        seen = set()
-        deduped = []
-        for h in headlines:
-            if h["title"] not in seen:
-                seen.add(h["title"])
-                deduped.append(h)
-        briefing[sector] = deduped[:6]
+        try:
+            resp = requests.get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item")[:6]:
+                title = item.findtext("title", default="Untitled")
+                link = item.findtext("link", default="")
+                author = item.findtext("author", default="")
+                pub_date = item.findtext("pubDate", default="")
+                headlines.append({"title": title, "link": link, "publisher": author, "pub_date": pub_date})
+        except Exception:
+            pass
+        briefing[sector] = headlines
     return briefing
 
 
@@ -1962,7 +1963,7 @@ elif page == "Market News":
 # =======================================================================
 elif page == "Daily Briefing":
     st.subheader("Daily Briefing")
-    st.caption("Top headlines from your focus areas, refreshed every few hours — pulled from representative tickers in each sector, not your held portfolio.")
+    st.caption("Top headlines from your focus areas, refreshed every few hours — pulled from dedicated topic feeds, not your held portfolio.")
 
     briefing = fetch_daily_briefing()
 
@@ -1973,17 +1974,16 @@ elif page == "Daily Briefing":
         else:
             for h in headlines:
                 pub = f" — *{h['publisher']}*" if h["publisher"] else ""
-                ticker_tag = f" `{h['source_ticker']}`"
                 if h["link"]:
-                    st.markdown(f"- [{h['title']}]({h['link']}){pub}{ticker_tag}")
+                    st.markdown(f"- [{h['title']}]({h['link']}){pub}")
                 else:
-                    st.markdown(f"- {h['title']}{pub}{ticker_tag}")
+                    st.markdown(f"- {h['title']}{pub}")
         st.divider()
 
     st.caption(
-        "Headlines are sourced via representative tickers per sector: Investment Product Advisory (BLK, TROW, SCHW), "
-        "FX Market (UUP, FXE, FXY), Metals & Mining (GLD, GDX, XME), Bond Market (TLT, AGG, LQD) — chosen as liquid, "
-        "well-covered proxies for each theme, not as investment recommendations."
+        "Headlines are sourced from dedicated topic feeds: Investment Product Advisory (ETF Analysis & Opinion), "
+        "FX Market (Forex News), Metals & Mining (Metals Analysis), Bond Market (Bonds Analysis & Opinion) — "
+        "each feed is specific to that theme, not a stock-price proxy."
     )
 
 

@@ -736,6 +736,43 @@ def fetch_news_for_asset_classes(tickers_map):
     return news_by_class
 
 
+DAILY_BRIEFING_SECTORS = {
+    "Investment Product Advisory": ["BLK", "TROW", "SCHW"],
+    "FX Market": ["UUP", "FXE", "FXY"],
+    "Metals & Mining": ["GLD", "GDX", "XME"],
+    "Bond Market": ["TLT", "AGG", "LQD"],
+}
+
+
+@st.cache_data(ttl=60 * 60 * 4)
+def fetch_daily_briefing():
+    briefing = {}
+    for sector, tickers in DAILY_BRIEFING_SECTORS.items():
+        headlines = []
+        for ticker in tickers:
+            try:
+                items = yf.Ticker(ticker).news[:3]
+                for item in items:
+                    content = item.get("content", item)
+                    title = content.get("title") or item.get("title", "Untitled")
+                    link = (content.get("canonicalUrl") or {}).get("url") or item.get("link", "")
+                    publisher = (content.get("provider") or {}).get("displayName", "")
+                    pub_date = (content.get("pubDate") or content.get("displayTime") or "")
+                    headlines.append({"title": title, "link": link, "publisher": publisher,
+                                      "source_ticker": ticker, "pub_date": pub_date})
+            except Exception:
+                continue
+        # De-duplicate identical headlines pulled from multiple tickers in the same sector
+        seen = set()
+        deduped = []
+        for h in headlines:
+            if h["title"] not in seen:
+                seen.add(h["title"])
+                deduped.append(h)
+        briefing[sector] = deduped[:6]
+    return briefing
+
+
 # =======================================================================
 # 11. EXPORT (CSV + PDF)
 # =======================================================================
@@ -1006,10 +1043,10 @@ with st.sidebar:
         menu_title=None,
         options=["Dashboard", "Risk Questionnaire", "Calculator", "Backtest & Risk", "Stress Testing",
                  "Efficient Frontier", "Sensitivity Index", "Rebalancing Simulator", "Quarterly Views",
-                 "Compare Profiles", "Market News", "Saved Portfolios", "Portfolio Education", "Strategy Guide"],
+                 "Compare Profiles", "Market News", "Daily Briefing", "Saved Portfolios", "Portfolio Education", "Strategy Guide"],
         icons=["speedometer2", "clipboard-check", "calculator", "graph-up-arrow", "exclamation-triangle",
                "bullseye", "activity", "arrow-repeat", "calendar3",
-               "bar-chart-steps", "newspaper", "save", "mortarboard", "book"],
+               "bar-chart-steps", "newspaper", "sun", "save", "mortarboard", "book"],
         default_index=0,
         styles={
             "container": {"padding": "0", "background-color": _p["sidebar_start"]},
@@ -1918,6 +1955,36 @@ elif page == "Market News":
                     pub = f" — *{h['publisher']}*" if h["publisher"] else ""
                     st.markdown(f"- [{h['title']}]({h['link']}){pub}" if h["link"] else f"- {h['title']}{pub}")
             st.markdown("")
+
+
+# =======================================================================
+# PAGE: DAILY BRIEFING
+# =======================================================================
+elif page == "Daily Briefing":
+    st.subheader("Daily Briefing")
+    st.caption("Top headlines from your focus areas, refreshed every few hours — pulled from representative tickers in each sector, not your held portfolio.")
+
+    briefing = fetch_daily_briefing()
+
+    for sector, headlines in briefing.items():
+        st.markdown(f"### {sector}")
+        if not headlines:
+            st.caption("No recent headlines available for this sector right now.")
+        else:
+            for h in headlines:
+                pub = f" — *{h['publisher']}*" if h["publisher"] else ""
+                ticker_tag = f" `{h['source_ticker']}`"
+                if h["link"]:
+                    st.markdown(f"- [{h['title']}]({h['link']}){pub}{ticker_tag}")
+                else:
+                    st.markdown(f"- {h['title']}{pub}{ticker_tag}")
+        st.divider()
+
+    st.caption(
+        "Headlines are sourced via representative tickers per sector: Investment Product Advisory (BLK, TROW, SCHW), "
+        "FX Market (UUP, FXE, FXY), Metals & Mining (GLD, GDX, XME), Bond Market (TLT, AGG, LQD) — chosen as liquid, "
+        "well-covered proxies for each theme, not as investment recommendations."
+    )
 
 
 # =======================================================================

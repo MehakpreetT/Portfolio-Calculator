@@ -737,7 +737,7 @@ def fetch_news_for_asset_classes(tickers_map):
 
 
 DAILY_BRIEFING_FEEDS = {
-    "Investment Product Advisory": "https://www.investing.com/rss/320.rss",       # ETF Analysis & Opinion
+    "Investment Product Advisory": "https://www.wealthmanagement.com/rss.xml",     # WealthManagement.com — SMAs, funds, ETF strategy, advisor/product trends
     "FX Market": "https://www.investing.com/rss/news_1.rss",                     # Forex News
     "Metals & Mining": "https://www.investing.com/rss/commodities_Metals.rss",   # Metals Analysis
     "Bond Market": "https://www.investing.com/rss/bonds.rss",                   # Bonds Analysis & Opinion
@@ -765,7 +765,9 @@ def fetch_daily_briefing():
             for item in root.findall(".//item")[:6]:
                 title = item.findtext("title", default="Untitled")
                 link = item.findtext("link", default="")
-                author = item.findtext("author", default="")
+                author = (item.findtext("author")
+                          or item.findtext("{http://purl.org/dc/elements/1.1/}creator")
+                          or "")
                 pub_date = item.findtext("pubDate", default="")
                 headlines.append({"title": title, "link": link, "publisher": author, "pub_date": pub_date})
         except Exception:
@@ -1981,9 +1983,10 @@ elif page == "Daily Briefing":
         st.divider()
 
     st.caption(
-        "Headlines are sourced from dedicated topic feeds: Investment Product Advisory (ETF Analysis & Opinion), "
-        "FX Market (Forex News), Metals & Mining (Metals Analysis), Bond Market (Bonds Analysis & Opinion) — "
-        "each feed is specific to that theme, not a stock-price proxy."
+        "Headlines are sourced from dedicated topic feeds: Investment Product Advisory (WealthManagement.com — "
+        "advisor practice, fund launches, SMAs, ETF and product strategy), FX Market (Forex News), Metals & Mining "
+        "(Metals Analysis), Bond Market (Bonds Analysis & Opinion) — each feed is specific to that theme, not a "
+        "stock-price proxy."
     )
 
 

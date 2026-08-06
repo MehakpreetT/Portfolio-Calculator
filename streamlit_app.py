@@ -41,14 +41,18 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # =======================================================================
 class RiskProfile(Enum):
     CONSERVATIVE = "Conservative"
+    INCOME = "Income"
     NEUTRAL = "Neutral"
     GROWTH = "Growth"
+    AGGRESSIVE_GROWTH = "Aggressive Growth"
 
 
 STRATEGIC_MIX = {
-    RiskProfile.CONSERVATIVE: {"cash": 0.02, "bonds": 0.53, "cdn_eq": 0.12, "us_eq": 0.13, "intl_eq": 0.10, "em_eq": 0.00, "gold": 0.05, "reit": 0.05},
-    RiskProfile.NEUTRAL:      {"cash": 0.02, "bonds": 0.33, "cdn_eq": 0.13, "us_eq": 0.22, "intl_eq": 0.13, "em_eq": 0.04, "gold": 0.05, "reit": 0.08},
-    RiskProfile.GROWTH:       {"cash": 0.02, "bonds": 0.18, "cdn_eq": 0.15, "us_eq": 0.26, "intl_eq": 0.16, "em_eq": 0.07, "gold": 0.06, "reit": 0.10},
+    RiskProfile.CONSERVATIVE:      {"cash": 0.02, "bonds": 0.53, "cdn_eq": 0.12, "us_eq": 0.13, "intl_eq": 0.10, "em_eq": 0.00, "gold": 0.05, "reit": 0.05},
+    RiskProfile.INCOME:            {"cash": 0.03, "bonds": 0.45, "cdn_eq": 0.15, "us_eq": 0.12, "intl_eq": 0.08, "em_eq": 0.00, "gold": 0.04, "reit": 0.13},
+    RiskProfile.NEUTRAL:           {"cash": 0.02, "bonds": 0.33, "cdn_eq": 0.13, "us_eq": 0.22, "intl_eq": 0.13, "em_eq": 0.04, "gold": 0.05, "reit": 0.08},
+    RiskProfile.GROWTH:            {"cash": 0.02, "bonds": 0.18, "cdn_eq": 0.15, "us_eq": 0.26, "intl_eq": 0.16, "em_eq": 0.07, "gold": 0.06, "reit": 0.10},
+    RiskProfile.AGGRESSIVE_GROWTH: {"cash": 0.01, "bonds": 0.08, "cdn_eq": 0.16, "us_eq": 0.32, "intl_eq": 0.18, "em_eq": 0.12, "gold": 0.04, "reit": 0.09},
 }
 
 TICKERS = {
@@ -80,6 +84,15 @@ STRATEGY_NOTES = {
         "time_horizon_fit": "Best suited to a horizon under 5 years, or for money you can't afford to see drop sharply in the short term.",
         "rebalancing_note": "Because the mix is bond-heavy, drift tends to be slower — checking in quarterly is usually enough.",
     },
+    RiskProfile.INCOME: {
+        "summary": "Prioritizes steady income generation over capital growth.",
+        "philosophy": "Heavily weighted toward fixed income and REITs for yield, with a larger REIT sleeve than any other profile. Equity exposure is kept modest and defensive, and emerging markets are excluded entirely.",
+        "expected_volatility": "Low-to-Moderate",
+        "who_its_for": "Investors who need the portfolio to generate regular cash flow — e.g. in or near retirement — rather than primarily grow in value.",
+        "typical_drawdown": "Historically, income-tilted mixes like this have seen peak-to-trough declines in the 12-18% range, slightly more than a pure conservative mix due to the larger REIT weight.",
+        "time_horizon_fit": "Works at any horizon where income matters more than growth, though it's most common for shorter horizons or those already drawing on the portfolio.",
+        "rebalancing_note": "REIT and bond income payouts can drift the mix over time even without price moves — a quarterly check helps keep yield-generating sleeves on target.",
+    },
     RiskProfile.NEUTRAL: {
         "summary": "Balances growth and stability.",
         "philosophy": "Roughly 60/40 growth-to-defensive split, diversified across regions plus gold and REIT sleeves to smooth out equity/bond correlation risk.",
@@ -97,6 +110,15 @@ STRATEGY_NOTES = {
         "typical_drawdown": "Historically, all-equity-leaning portfolios like this have seen peak-to-trough declines of 30%+ in severe downturns (e.g. 2008, early 2020).",
         "time_horizon_fit": "Best suited to a 15+ year horizon, where there's time to recover from a deep drawdown without needing to sell at a loss.",
         "rebalancing_note": "Higher equity weight means faster drift — worth checking quarterly, especially after a strong equity rally.",
+    },
+    RiskProfile.AGGRESSIVE_GROWTH: {
+        "summary": "Maximizes long-run growth potential, accepting the highest volatility of any profile.",
+        "philosophy": "Nearly all-equity, with the largest emerging markets sleeve of any profile and only a token allocation to bonds and cash. Built for investors chasing the highest achievable long-run return, not a smooth ride.",
+        "expected_volatility": "Very High",
+        "who_its_for": "Investors with a very long horizon, high risk tolerance, and no near-term need to access the funds — often the youngest investors or a small satellite portion of a larger portfolio.",
+        "typical_drawdown": "Historically, mixes this equity- and EM-heavy have seen peak-to-trough declines of 35-45%+ in the worst downturns, with EM adding extra volatility beyond a standard all-equity mix.",
+        "time_horizon_fit": "Best suited to a 20+ year horizon — there's essentially no cushion here, so time is the only real risk management tool.",
+        "rebalancing_note": "This mix drifts the fastest of any profile — a quarterly check is worthwhile, especially after sharp EM or equity moves.",
     },
 }
 
@@ -248,8 +270,18 @@ def market_condition_score(cache_key: str):
     try:
         vix_hist = yf.Ticker("^VIX").history(period="10d")
         spx_hist = yf.Ticker("^GSPC").history(period="10d")
-        vix_hist = vix_hist.iloc[:-1] if len(vix_hist) > 1 else vix_hist
-        spx_hist = spx_hist.iloc[:-1] if len(spx_hist) > 1 else spx_hist
+
+        if vix_hist.empty or spx_hist.empty:
+            return None, "No data returned from Yahoo Finance for ^VIX or ^GSPC right now.", None
+
+        # Drop today's still-forming row only if we have enough history to spare it.
+        if len(vix_hist) > 2:
+            vix_hist = vix_hist.iloc[:-1]
+        if len(spx_hist) > 2:
+            spx_hist = spx_hist.iloc[:-1]
+
+        if len(vix_hist) < 1 or len(spx_hist) < 2:
+            return None, "Not enough recent trading days returned to compute momentum yet.", None
 
         prev_day_vix_open = vix_hist["Open"].iloc[-1]
         prev_day_spx_open = spx_hist["Open"].iloc[-1]
@@ -263,7 +295,7 @@ def market_condition_score(cache_key: str):
         score = round(0.5 * vix_score + 0.5 * momentum_score, 2)
         return score, as_of_date, prev_day_vix_open
     except Exception as e:
-        return None, str(e), None
+        return None, f"Error fetching market data: {e}", None
 
 
 @st.cache_data(ttl=60 * 60 * 24)
@@ -345,16 +377,27 @@ def build_portfolio(risk_profile, horizon_years, market_score):
 # =======================================================================
 @st.cache_data(ttl=60 * 60 * 6)
 def validate_ticker(ticker: str):
+    """
+    Validity is determined purely by whether price history exists — that's
+    the only thing that actually matters for using the ticker in the app.
+    The display name lookup (t.info) is unreliable/slow for some tickers in
+    yfinance and is treated as a nice-to-have: if it fails, we still accept
+    the ticker and just fall back to showing the raw symbol as its name.
+    """
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="5d")
         if hist.empty:
             return False, None
-        info = t.info
-        name = info.get("shortName") or info.get("longName") or ticker
-        return True, name
     except Exception:
         return False, None
+
+    try:
+        info = t.info
+        name = info.get("shortName") or info.get("longName") or ticker
+    except Exception:
+        name = ticker
+    return True, name
 
 
 # =======================================================================
@@ -1044,11 +1087,11 @@ with st.sidebar:
     _p = THEME_PALETTES[st.session_state.theme]
     page = option_menu(
         menu_title=None,
-        options=["Dashboard", "Risk Questionnaire", "Calculator", "Backtest & Risk", "Stress Testing",
-                 "Efficient Frontier", "Sensitivity Index", "Rebalancing Simulator", "Quarterly Views",
+        options=["Dashboard", "Risk Questionnaire", "Calculator", "Backtest & Risk",
+                 "Efficient Frontier", "Sensitivity Index", "Quarterly Views",
                  "Compare Profiles", "Market News", "Daily Briefing", "Saved Portfolios", "Portfolio Education", "Strategy Guide"],
-        icons=["speedometer2", "clipboard-check", "calculator", "graph-up-arrow", "exclamation-triangle",
-               "bullseye", "activity", "arrow-repeat", "calendar3",
+        icons=["speedometer2", "clipboard-check", "calculator", "graph-up-arrow",
+               "bullseye", "activity", "calendar3",
                "bar-chart-steps", "newspaper", "sun", "save", "mortarboard", "book"],
         default_index=0,
         styles={
@@ -1120,6 +1163,8 @@ if page == "Dashboard":
         st.metric("As-of Date (9:00 AM open)", as_of if score is not None else "unavailable")
     with m3:
         st.metric("Prior-Day VIX (open)", f"{vix_level:.2f}" if vix_level else "N/A")
+    if score is None:
+        st.caption(f"Market condition data unavailable: {as_of}")
 
     st.markdown("**Central Bank Policy Rates**")
     rates = fetch_central_bank_rates()
@@ -1163,6 +1208,35 @@ if page == "Dashboard":
                     """, unsafe_allow_html=True)
     else:
         st.caption("Currency rate data unavailable right now.")
+
+    st.divider()
+
+    st.markdown("**Quick Portfolio Preview**")
+    st.caption("Pick a risk profile and horizon to see the allocation update instantly — no need to visit the Calculator page.")
+    qp1, qp2 = st.columns(2)
+    with qp1:
+        quick_profile = st.selectbox("Risk Profile", [p.value for p in RiskProfile], index=2, key="dash_quick_profile")
+    with qp2:
+        quick_horizon = st.slider("Horizon (years)", 1, 50, 10, key="dash_quick_horizon")
+
+    quick_weights = build_portfolio(RiskProfile(quick_profile), quick_horizon, score)
+    qleft, qright = st.columns([1, 1.3])
+    with qleft:
+        quick_fig = go.Figure(data=[go.Pie(
+            labels=[ASSET_LABELS[k] for k in quick_weights], values=[v * 100 for v in quick_weights.values()],
+            hole=0.45, textinfo="label+percent",
+        )])
+        quick_fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
+                                 paper_bgcolor="rgba(0,0,0,0)", font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
+        st.plotly_chart(quick_fig, use_container_width=True, key="dash_quick_pie")
+    with qright:
+        quick_exp_ret = expected_return({k: v for k, v in quick_weights.items() if k in st.session_state.custom_expected_returns},
+                                         st.session_state.custom_expected_returns)
+        st.metric("Illustrative Expected Return", f"{quick_exp_ret*100:.2f}%")
+        quick_df = pd.DataFrame({"Asset": [ASSET_LABELS[k] for k in quick_weights],
+                                  "Weight": [f"{v*100:.1f}%" for v in quick_weights.values()]})
+        st.dataframe(quick_df, use_container_width=True, hide_index=True)
+    st.caption("This is a live preview only — go to the Calculator page to save it or customize further.")
 
     st.divider()
 
@@ -1213,12 +1287,16 @@ elif page == "Risk Questionnaire":
 
     if st.button("Get My Risk Profile"):
         total_score = sum(answers)
-        if total_score <= -2:
+        if total_score <= -3:
             suggested = RiskProfile.CONSERVATIVE
-        elif total_score >= 2:
+        elif total_score <= -1:
+            suggested = RiskProfile.INCOME
+        elif total_score == 0:
+            suggested = RiskProfile.NEUTRAL
+        elif total_score <= 2:
             suggested = RiskProfile.GROWTH
         else:
-            suggested = RiskProfile.NEUTRAL
+            suggested = RiskProfile.AGGRESSIVE_GROWTH
 
         st.session_state["_suggested_profile"] = suggested.value
         st.success(f"Based on your answers, your suggested risk profile is **{suggested.value}**.")
@@ -1268,6 +1346,8 @@ elif page == "Calculator":
         st.metric("As-of Date (9:00 AM open)", as_of if score is not None else "unavailable")
     with m3:
         st.metric("Prior-Day VIX (open)", f"{vix_level:.2f}" if vix_level else "N/A")
+    if score is None:
+        st.caption(f"Market condition data unavailable: {as_of}")
 
     if calculate:
         risk_profile = RiskProfile(risk_choice)
@@ -1397,17 +1477,37 @@ elif page == "Calculator":
 
         st.divider()
         st.subheader("Custom Weights")
+        st.caption("Adjust sliders to change weights, or check 'Remove' to drop an asset from the portfolio entirely — the preview below updates live.")
         manual_weights = {}
         cols = st.columns(4)
         for i, k in enumerate(weights):
             with cols[i % 4]:
-                manual_weights[k] = st.slider(combined_labels[k], 0, 100, int(round(weights[k] * 100)), key=f"slider_{k}")
+                removed = st.checkbox(f"Remove {combined_labels[k]}", key=f"remove_{k}")
+                if not removed:
+                    manual_weights[k] = st.slider(combined_labels[k], 0, 100, int(round(weights[k] * 100)), key=f"slider_{k}")
         raw_total = sum(manual_weights.values())
         normalized_manual = {k: v / raw_total for k, v in manual_weights.items()} if raw_total > 0 else weights
         st.caption(f"Raw slider total: {raw_total}% (auto-normalized to 100% on apply)")
+
+        if manual_weights:
+            preview_fig = go.Figure(data=[go.Pie(
+                labels=[combined_labels[k] for k in manual_weights],
+                values=[v for v in manual_weights.values()],
+                hole=0.45, textinfo="label+percent",
+            )])
+            preview_fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10),
+                                       paper_bgcolor="rgba(0,0,0,0)",
+                                       font=dict(color=THEME_PALETTES[st.session_state.theme]["text"]))
+            st.plotly_chart(preview_fig, use_container_width=True, key="live_preview_pie")
+        else:
+            st.info("Every asset is marked for removal — uncheck at least one to see a preview.")
+
         if st.button("Apply Manual Weights"):
             st.session_state.current_weights = normalized_manual
             st.session_state.is_customized = True
+            for k in list(weights.keys()):
+                if k not in normalized_manual:
+                    st.session_state.custom_tickers.pop(k, None)
             st.success("Manual weights applied.")
             st.rerun()
 
@@ -1521,50 +1621,6 @@ elif page == "Backtest & Risk":
                     st.success(f"Your stop-loss threshold of {stop_loss_pct:.0f}% was not breached over this period (max drawdown: {result['max_drawdown']*100:.1f}%).")
 
                 st.caption(f"Sharpe ratio assumes a {RISK_FREE_RATE*100:.1f}% annualized risk-free rate. Past performance is not indicative of future results.")
-
-
-# =======================================================================
-# PAGE: STRESS TESTING
-# =======================================================================
-elif page == "Stress Testing":
-    st.subheader("Stress Testing")
-    st.caption("Applies the actual historical returns of your held assets during past crisis periods to your current weights — showing what would have happened, not a prediction of what will.")
-
-    selection = select_portfolio_for_page("stress")
-    if selection:
-        weights = selection["weights"]
-        tickers_map = selection["tickers_map"]
-        labels_map = selection["labels_map"]
-        amount = selection["amount"]
-
-        scenario = st.selectbox("Scenario", list(STRESS_SCENARIOS.keys()))
-        start, end = STRESS_SCENARIOS[scenario]
-        st.caption(f"Window: {start} to {end}")
-
-        if st.button("Run Stress Test"):
-            with st.spinner("Pulling historical crisis-period data..."):
-                result = run_stress_test(weights, tickers_map, amount, start, end)
-            st.session_state["_stress_result"] = (scenario, result)
-
-        cached = st.session_state.get("_stress_result")
-        if cached:
-            cached_scenario, result = cached
-            if result["portfolio_pct_impact"] is None:
-                st.error("No usable price data for this scenario — the held tickers may not have existed yet.")
-            else:
-                st.metric(f"Estimated Portfolio Impact ({cached_scenario})",
-                          f"{result['portfolio_pct_impact']*100:+.1f}%",
-                          delta=f"${result['dollar_impact']:,.0f}")
-                st.caption(f"Based on {result['covered_weight']*100:.0f}% of your portfolio's weight (some assets may lack data this far back).")
-
-                if result["missing"]:
-                    st.warning(f"No historical data available for: {', '.join(result['missing'])} — excluded from this estimate.")
-
-                asset_df = pd.DataFrame({
-                    "Asset Class": [labels_map.get(k, k) for k in result["per_asset_impact"]],
-                    "Change During Scenario": [f"{v*100:+.1f}%" for v in result["per_asset_impact"].values()],
-                })
-                st.dataframe(asset_df, use_container_width=True, hide_index=True)
 
 
 # =======================================================================
@@ -1720,81 +1776,6 @@ elif page == "Sensitivity Index":
 
 
 # =======================================================================
-# PAGE: REBALANCING SIMULATOR
-# =======================================================================
-elif page == "Rebalancing Simulator":
-    st.subheader("Rebalancing Simulator")
-    st.caption("Pick a saved portfolio to see how its weights would have drifted since you saved it, and what trades would bring it back to target.")
-
-    with st.expander("How this works"):
-        st.markdown("""
-        When you save a portfolio, Wealthscope records its target weights, the dollar amount, and the save date.
-        This tool then:
-        1. Pulls actual historical prices for each holding from the save date to today
-        2. Calculates how many "shares" your dollar amount would have bought at the save-date price
-        3. Revalues those shares at today's price to see your current dollar value per holding
-        4. Compares the resulting current weights to your original targets — the difference is drift
-        5. Calculates the dollar trade needed per holding to bring weights back to target
-
-        **Why it might say no data is available:** yfinance (the price data source) needs at least one full
-        trading day to have closed between your save date and today. If you just saved a portfolio, come back
-        tomorrow.
-        """)
-
-    portfolios = load_saved_portfolios(username)
-    if not portfolios:
-        st.info("No saved portfolios yet — save one from the Calculator page first.")
-    else:
-        options = [f"{p['name']} (saved {p['date_saved']})" for p in portfolios]
-        selected_idx = st.selectbox("Choose a saved portfolio", range(len(options)), format_func=lambda i: options[i])
-        chosen = portfolios[selected_idx]
-
-        tickers_map = dict(TICKERS)
-        labels_map = dict(ASSET_LABELS)
-        for key, v in chosen.get("custom_tickers", {}).items():
-            tickers_map[key] = v["ticker"]
-            labels_map[key] = f"{v['name']} ({v['ticker']})"
-
-        drift_threshold = st.slider("Rebalancing threshold (%)", 1, 20, 5)
-
-        if st.button("Simulate Drift"):
-            with st.spinner("Pulling price history since the save date..."):
-                result = simulate_rebalancing(chosen["weights"], tickers_map, chosen["amount"], chosen["date_saved"])
-            st.session_state["_rebal_result"] = result
-
-        result = st.session_state.get("_rebal_result")
-        if result:
-            if "error" in result:
-                st.error(f"Couldn't simulate drift: {result['error']}")
-            else:
-                st.caption(f"Simulated from {result['start_date']} to today. Current total value: ${result['total_current']:,.2f} (started at ${chosen['amount']:,.2f}).")
-
-                rows = []
-                any_breach = False
-                for k in chosen["weights"]:
-                    target = chosen["weights"][k]
-                    current = result["current_weights"].get(k, 0.0)
-                    drift = result["drift"].get(k, 0.0)
-                    breach = abs(drift) * 100 > drift_threshold
-                    any_breach = any_breach or breach
-                    rows.append({
-                        "Asset Class": labels_map.get(k, k),
-                        "Target Weight": f"{target*100:.1f}%",
-                        "Current Weight": f"{current*100:.1f}%",
-                        "Drift": f"{drift*100:+.1f}%",
-                        "Suggested Trade": f"{'Buy' if result['trades_needed'][k] > 0 else 'Sell'} ${abs(result['trades_needed'][k]):,.0f}",
-                        "Breach?": "Yes" if breach else "No",
-                    })
-
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-                if any_breach:
-                    st.warning(f"One or more asset classes have drifted more than {drift_threshold}% from target — rebalancing is suggested.")
-                else:
-                    st.success(f"No asset class has drifted more than {drift_threshold}% from target — no rebalancing needed yet.")
-
-
-# =======================================================================
 # PAGE: QUARTERLY VIEWS
 # =======================================================================
 elif page == "Quarterly Views":
@@ -1860,7 +1841,7 @@ elif page == "Compare Profiles":
         compare_horizon = st.number_input("Horizon for comparison (years)", min_value=1, max_value=50, value=10, key="compare_horizon")
 
         score, as_of, _ = market_condition_score(str(date.today()))
-        cols = st.columns(3)
+        cols = st.columns(len(RiskProfile))
         for i, profile in enumerate(RiskProfile):
             w = build_portfolio(profile, compare_horizon, score)
             with cols[i]:
